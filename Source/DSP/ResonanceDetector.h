@@ -91,31 +91,42 @@ namespace ResonaPro
             previousPeriod = 0.0f;
             historyValid = false;
             std::fill (previousMagDb.begin(), previousMagDb.end(), -240.0f);
+            lastReferencePromDb = 0.0f;
         }
 
-        float binFrequency (int k) const noexcept
+        float binFrequency (int bin) const noexcept
         {
-            return std::max (20.0f, static_cast<float> (k) * binWidth);
+            return std::max (20.0f, static_cast<float> (bin) * binWidth);
         }
 
+        /** Detects resonance excess per bin.
+
+            @param magnitude  Linear magnitude spectrum [bins].
+            @param weightsDb  Per-bin focus band cue weights in dB (from ParametricEQWeighting).
+            @param out        Output per-bin resonance excess in dB [bins].
+            @param p          Detection parameters.
+        */
         void detect (const float* magnitude,
                      const float* weightsDb,
                      float* out,
                      const DetectorParams& p)
         {
-            if (magnitude == nullptr || out == nullptr || bins <= 0)
+            if (magnitude == nullptr || out == nullptr || bins <= 0) return;
+
+            // ---- 1. Magnitude prefix sums and peak envelope -----------------------
+            double framePeak = 0.0;
+            for (int k = 0; k < bins; ++k)
+                if (magnitude[k] > framePeak) framePeak = magnitude[k];
+
+            if (framePeak < 1.0e-7)
+            {
+                std::fill (out, out + bins, 0.0f);
+                std::fill (prominenceDb.begin(), prominenceDb.end(), 0.0f);
                 return;
+            }
 
+            const float refMag = static_cast<float> (framePeak);
             const float detailTilt = std::clamp (p.detailTilt, -1.0f, 1.0f);
-
-            // ---- 1. Vectorized Peak & Prefix sums ---------------------------------
-            float peakVal = 0.0f;
-            vDSP_maxv (magnitude, 1, &peakVal, static_cast<vDSP_Length> (bins));
-            const double framePeak = static_cast<double> (peakVal);
-
-            const float refMag = fullScaleReference > 0.0f
-                                    ? fullScaleReference
-                                    : static_cast<float> (framePeak > 1.0e-9 ? framePeak : 1.0e-9);
 
             prefix[0] = 0.0;
             for (int k = 0; k < bins; ++k)
@@ -153,7 +164,7 @@ namespace ResonaPro
                 magSmooth[static_cast<size_t> (k)] = wsum > 0.0f ? sum / wsum : magnitude[k];
             }
 
-            // ---- 2. Harmonic period tracking --------------------------------------
+            // ---- 2. Harmonic period tracking (for low fundamental separation) ----
             activeBins.clear();
             for (int k = 1; k < bins - 1; ++k)
                 if (magnitude[k] >= activityGate)
@@ -208,10 +219,7 @@ namespace ResonaPro
             }
 
             // ---- 3. ERB Psychoacoustic Auditory Baseline Radii --------------------
-            // Uses Glasberg & Moore Equivalent Rectangular Bandwidth (ERB) scaling:
-            // Prevents high frequencies (>2 kHz) from having excessively wide analysis spans
-            // which previously caused high-end baseline inflation and destroyed high-frequency prominence!
-            const int maxRadius = std::max (4, bins / 12);
+            const int maxRadius = std::max (4, bins / 14);
             minRadiusBins = std::clamp (minRadiusBins, 0, maxRadius);
 
             for (int k = 0; k < bins; ++k)
@@ -221,19 +229,20 @@ namespace ResonaPro
                 const float tiltMul = std::pow (ratio, 0.50f * detailTilt);
                 const float effSharpness = std::clamp (p.sharpness * tiltMul, 0.20f, 5.0f);
 
-                // ERB auditory bandwidth:
-                const float erbHz = (24.7f * (4.37f * (f * 0.001f) + 1.0f)) * (1.1f / effSharpness);
+                // Glasberg & Moore ERB bandwidth:
+                const float erbHz = (24.7f * (4.37f * (f * 0.001f) + 1.0f)) * (1.0f / effSharpness);
                 const int erbBins = std::clamp (static_cast<int> (erbHz / binWidth), 3, maxRadius);
 
                 radialBins[static_cast<size_t> (k)] = std::clamp (std::max (erbBins, minRadiusBins), 3, maxRadius);
             }
 
-            // ---- 4. Prominence per bin (Vectorized shoulder sampling) -------------
+            // ---- 4. Prominence per bin -------------------------------------------
             float maxProm = 0.0f;
             for (int k = 0; k < bins; ++k)
             {
                 const int rad   = radialBins[static_cast<size_t> (k)];
                 const int guard = std::max (2, rad / 3);
+                const float fHz = binFreq[static_cast<size_t> (k)];
 
                 const int lFrom = k - rad;
                 const int lTo   = k - guard - 1;
@@ -247,8 +256,10 @@ namespace ResonaPro
                 float base;
                 if (shoulderScratch.size() >= 3)
                 {
-                    // Sample 75th percentile of local shoulder to track true acoustic valley floor
-                    const size_t idx = static_cast<size_t> (0.75f * static_cast<float> (shoulderScratch.size() - 1));
+                    // 60th percentile for highs (>= 2.5 kHz) to track true baseline floor beside sibilants
+                    // 75th percentile for lows to track harmonic troughs
+                    const float pct = (fHz >= 2500.0f) ? 0.60f : 0.75f;
+                    const size_t idx = static_cast<size_t> (pct * static_cast<float> (shoulderScratch.size() - 1));
                     std::nth_element (shoulderScratch.begin(),
                                       shoulderScratch.begin() + static_cast<long> (idx),
                                       shoulderScratch.end());
@@ -278,7 +289,7 @@ namespace ResonaPro
                 maxProm = std::max (maxProm, prom);
             }
 
-            // ---- 5. Adaptive reference from peak statistics -----------------------
+            // ---- 5. Peak Scratch & Reference Monitoring --------------------------
             peakScratch.clear();
             for (int k = 1; k < bins - 1; ++k)
             {
@@ -296,12 +307,8 @@ namespace ResonaPro
                 referenceProm = std::clamp (peakScratch[mid], 0.5f, 20.0f);
             }
 
-            // ---- 6. Dynamic Per-Bin Threshold & High-Frequency Sensitivity -------
-            const float depthOffsetDb = 3.5f * std::clamp (p.depth, 0.0f, 4.0f);
-            const float baseThresholdDb = referenceProm + p.selectivity * 6.0f - depthOffsetDb;
-
-            const float hardOffsetDb = p.hardMode ? (3.0f - 2.0f * std::clamp (p.depth, 0.0f, 4.0f))
-                                                  : 0.0f;
+            // ---- 6. Cue-Gated, Cue-Proportional Dynamic Resonance Processing -----
+            const float hardOffsetDb = p.hardMode ? (2.0f - 1.5f * std::clamp (p.depth, 0.0f, 4.0f)) : 0.0f;
 
             for (int k = 0; k < bins; ++k)
             {
@@ -315,73 +322,71 @@ namespace ResonaPro
                 const float fHz = binFreq[static_cast<size_t> (k)];
                 const float rawCueWeight = (weightsDb != nullptr) ? weightsDb[static_cast<size_t> (k)] : 0.0f;
 
-                // High-End Cue Responsiveness Boost:
-                // High frequencies naturally have -6 dB/octave less acoustic energy than chest fundamentals.
-                // When the user raises a cue in the high frequencies (> 2.5 kHz), scale the cue influence by 1.35x
-                // so high-end nodes have instant, decisive, highly sensitive resonance suppression!
-                float cueWeight = rawCueWeight;
-                if (fHz >= 2500.0f && rawCueWeight > 0.0f)
-                    cueWeight = rawCueWeight * 1.35f;
-
-                const bool isSibilanceBand = (fHz >= 4000.0f && fHz <= 9500.0f);
-
-                // Transient protection:
-                float transientPenalty = std::clamp (p.transientActivity, 0.0f, 1.0f)
-                                       * std::clamp (p.transientGuard, 0.0f, 1.0f) * 6.0f;
-                if (isSibilanceBand)
+                // RULE 1: STRICT CUE GATING
+                // If the user has not moved a cue up in this frequency range (rawCueWeight <= 0.05 dB),
+                // resonance reduction in this bin is ZERO. Turning up Depth with neutral cues leaves
+                // the entire vocal completely untouched!
+                if (rawCueWeight <= 0.05f)
                 {
-                    const float sibTame = std::clamp (p.sibilanceSmooth, 0.0f, 1.0f);
-                    transientPenalty *= (1.0f - 0.85f * sibTame);
+                    out[k] = 0.0f;
+                    continue;
                 }
 
-                // Natural high-frequency tilt compensation:
-                // Gently biases sensitivity above 3 kHz to balance high-end resonance detection with low-end
-                float freqTiltOffsetDb = 0.0f;
+                // RULE 2: HIGH-FREQUENCY SENSITIVITY CALIBRATION
+                // In the upper register (>= 2.5 kHz), vocal harmonics & sibilance naturally have smaller
+                // peak-to-floor ratios. We boost cue weight sensitivity by 1.5x so high-end nodes
+                // have immediate, powerful, surgical bite!
+                float cueWeight = rawCueWeight;
                 if (fHz >= 2500.0f)
-                    freqTiltOffsetDb = -1.5f * std::min (2.0f, std::log2 (fHz / 2500.0f));
+                    cueWeight = rawCueWeight * 1.5f;
 
-                float thr = baseThresholdDb + hardOffsetDb + transientPenalty + freqTiltOffsetDb - cueWeight;
+                // Frequency-localized nominal threshold:
+                // Lows: ~5.0 dB, Mids: ~3.0 dB, Highs: ~1.2 dB, Air: ~0.8 dB
+                float nominalThresholdDb;
+                if (fHz < 1000.0f)
+                    nominalThresholdDb = 5.0f + p.selectivity * 3.5f;
+                else if (fHz < 3000.0f)
+                    nominalThresholdDb = 3.0f + p.selectivity * 2.5f;
+                else if (fHz < 10000.0f)
+                    nominalThresholdDb = 1.2f + p.selectivity * 1.5f;
+                else
+                    nominalThresholdDb = 0.8f + p.selectivity * 1.0f;
+
+                const bool isSibilanceBand = (fHz >= 3500.0f && fHz <= 10500.0f);
+
+                // Transient protection: Only applied to low/mid fundamentals (fHz < 3000 Hz)
+                // High-end cues deliberately target harsh consonants/sibilants and must NOT be blocked!
+                float transientPenalty = 0.0f;
+                if (fHz < 3000.0f)
+                {
+                    transientPenalty = std::clamp (p.transientActivity, 0.0f, 1.0f)
+                                     * std::clamp (p.transientGuard, 0.0f, 1.0f) * 5.0f;
+                }
+
+                // Profile and ISO226 offsets
+                float thr = nominalThresholdDb + hardOffsetDb + transientPenalty - cueWeight;
                 thr += profileOffsetDb[static_cast<size_t> (k)];
                 if (p.useIso226)
                     thr += iso226Db[static_cast<size_t> (k)];
 
                 if (isSibilanceBand && p.sibilanceSmooth > 0.05f)
                 {
-                    const float sibilanceSensDb = 2.5f * p.sibilanceSmooth;
+                    const float sibilanceSensDb = 3.0f * p.sibilanceSmooth;
                     thr -= sibilanceSensDb;
                 }
 
-                float excess = prominenceDb[static_cast<size_t> (k)] - thr;
-                if (excess <= 0.0f)
+                float rawExcess = prominenceDb[static_cast<size_t> (k)] - thr;
+                if (rawExcess <= 0.0f)
                 {
                     out[k] = 0.0f;
                     continue;
                 }
 
-                // Curvature check for high frequencies (guards against flat noise floor, relaxed when cue is boosted):
-                if (excess > 0.0f && k >= 2 && k < bins - 2 && fHz >= 1800.0f && rawCueWeight <= 0.5f)
-                {
-                    const float mPrev  = magDb[static_cast<size_t> (k - 1)];
-                    const float mCurr  = magDb[static_cast<size_t> (k)];
-                    const float mNext  = magDb[static_cast<size_t> (k + 1)];
-                    const float mPrev2 = magDb[static_cast<size_t> (k - 2)];
-                    const float mNext2 = magDb[static_cast<size_t> (k + 2)];
-
-                    const float curv1 = mCurr - 0.5f * (mPrev + mNext);
-                    const float curv2 = 0.6f * (mCurr - 0.5f * (mPrev2 + mNext2));
-                    const float peakCurv = std::max (curv1, curv2);
-
-                    float minCurv = isSibilanceBand ? 0.15f : 0.40f;
-                    const float curvWeight = std::clamp ((peakCurv - minCurv) / 0.8f, 0.25f, 1.0f);
-                    excess *= curvWeight;
-                }
-
-                // Air-band preservation above 11 kHz (only when NO cue is boosted there):
-                if (fHz > 11000.0f && rawCueWeight <= 0.0f)
-                {
-                    const float airTaper = std::clamp (1.0f - (fHz - 11000.0f) / 4500.0f, 0.30f, 1.0f);
-                    excess *= airTaper;
-                }
+                // RULE 3: PROPORTIONAL CUE SCALING
+                // The amount of reduction scales directly with how far the user raised the cue!
+                // +6 dB cue gives 1.0x baseline factor; +12 dB to +24 dB gives deep surgical suppression.
+                const float cueScale = std::clamp (cueWeight / 6.0f, 0.15f, 4.0f);
+                float excess = rawExcess * cueScale;
 
                 if (p.hardMode && excess > 0.0f)
                 {
@@ -390,7 +395,7 @@ namespace ResonaPro
                     excess *= levelWeight;
                 }
 
-                // Note Motion protection:
+                // Note Motion protection (low registers only):
                 if (p.motionProtect > 0.0f && historyValid && previousPeriod >= 3.0f
                     && periodSmooth >= 3.0f && binFreq[static_cast<size_t> (k)] < 1500.0f)
                 {
@@ -407,7 +412,7 @@ namespace ResonaPro
                     }
                 }
 
-                out[k] = std::clamp (excess, 0.0f, 40.0f);
+                out[k] = std::clamp (excess, 0.0f, 48.0f);
             }
 
             out[0] = 0.0f;
