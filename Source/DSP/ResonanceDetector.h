@@ -321,27 +321,26 @@ namespace ResonaPro
 
                 const float fHz = binFreq[static_cast<size_t> (k)];
                 const float rawCueWeight = (weightsDb != nullptr) ? weightsDb[static_cast<size_t> (k)] : 0.0f;
+                const bool isSibilanceBand = (fHz >= 4000.0f && fHz <= 12000.0f);
+                
+                // The dedicated Sibilance smoother creates its own "virtual cue" in the high end.
+                // This ensures sibilance reduction works even if standard EQ cues are flat.
+                float effectiveCue = std::max(0.0f, rawCueWeight);
+                if (isSibilanceBand && p.sibilanceSmooth > 0.01f)
+                {
+                    effectiveCue = std::max(effectiveCue, p.sibilanceSmooth * 6.0f); // Up to +6dB equivalent cue
+                }
 
                 // RULE 1: STRICT CUE GATING
-                // If the user has not moved a cue up in this frequency range (rawCueWeight <= 0.05 dB),
-                // resonance reduction in this bin is ZERO. Turning up Depth with neutral cues leaves
-                // the entire vocal completely untouched!
-                if (rawCueWeight <= 0.05f)
+                // If the user has not moved a cue up (and no sibilance smoothing is active),
+                // resonance reduction is EXACTLY zero.
+                if (effectiveCue <= 0.05f)
                 {
                     out[k] = 0.0f;
                     continue;
                 }
 
-                // RULE 2: HIGH-FREQUENCY SENSITIVITY CALIBRATION
-                // In the upper register (>= 2.5 kHz), vocal harmonics & sibilance naturally have smaller
-                // peak-to-floor ratios. We boost cue weight sensitivity by 1.5x so high-end nodes
-                // have immediate, powerful, surgical bite!
-                float cueWeight = rawCueWeight;
-                if (fHz >= 2500.0f)
-                    cueWeight = rawCueWeight * 1.5f;
-
                 // Frequency-localized nominal threshold:
-                // Lows: ~5.0 dB, Mids: ~3.0 dB, Highs: ~1.2 dB, Air: ~0.8 dB
                 float nominalThresholdDb;
                 if (fHz < 1000.0f)
                     nominalThresholdDb = 5.0f + p.selectivity * 3.5f;
@@ -352,28 +351,19 @@ namespace ResonaPro
                 else
                     nominalThresholdDb = 0.8f + p.selectivity * 1.0f;
 
-                const bool isSibilanceBand = (fHz >= 3500.0f && fHz <= 10500.0f);
-
-                // Transient protection: Only applied to low/mid fundamentals (fHz < 3000 Hz)
-                // High-end cues deliberately target harsh consonants/sibilants and must NOT be blocked!
-                float transientPenalty = 0.0f;
-                if (fHz < 3000.0f)
-                {
-                    transientPenalty = std::clamp (p.transientActivity, 0.0f, 1.0f)
-                                     * std::clamp (p.transientGuard, 0.0f, 1.0f) * 5.0f;
-                }
-
-                // Profile and ISO226 offsets
-                float thr = nominalThresholdDb + hardOffsetDb + transientPenalty - cueWeight;
+                float thr = nominalThresholdDb + hardOffsetDb;
                 thr += profileOffsetDb[static_cast<size_t> (k)];
                 if (p.useIso226)
                     thr += iso226Db[static_cast<size_t> (k)];
 
                 if (isSibilanceBand && p.sibilanceSmooth > 0.05f)
                 {
-                    const float sibilanceSensDb = 3.0f * p.sibilanceSmooth;
-                    thr -= sibilanceSensDb;
+                    thr -= (4.0f * p.sibilanceSmooth);
                 }
+
+                // Lower the threshold slightly based on the cue to grab more resonance, 
+                // but cap it so we don't start suppressing the raw noise floor.
+                thr -= std::min(effectiveCue * 0.5f, 5.0f);
 
                 float rawExcess = prominenceDb[static_cast<size_t> (k)] - thr;
                 if (rawExcess <= 0.0f)
@@ -382,11 +372,33 @@ namespace ResonaPro
                     continue;
                 }
 
-                // RULE 3: PROPORTIONAL CUE SCALING
-                // The amount of reduction scales directly with how far the user raised the cue!
-                // +6 dB cue gives 1.0x baseline factor; +12 dB to +24 dB gives deep surgical suppression.
-                const float cueScale = std::clamp (cueWeight / 6.0f, 0.15f, 4.0f);
+                // RULE 2: STRICT PROPORTIONAL SCALING
+                // This is the magic. The amount of reduction scales DIRECTLY with the cue size.
+                // A tiny 0.1 dB filter tail only produces a 0.016x multiplier (effectively 0).
+                // A +6 dB cue gives a 1.0x multiplier. A +12 dB cue gives 2.0x.
+                float cueScale = effectiveCue / 6.0f;
+
+                // RULE 3: HIGH-FREQUENCY SENSITIVITY FIX
+                // The user noted the high-end was not catching resonance. We boost the cue scale
+                // massively in the upper register to ensure immediate, surgical bite.
+                if (fHz >= 2500.0f)
+                {
+                    cueScale *= 2.5f;
+                }
+
+                cueScale = std::clamp(cueScale, 0.0f, 6.0f);
                 float excess = rawExcess * cueScale;
+
+                // Transient protection (lows/mids only)
+                if (fHz < 3000.0f)
+                {
+                    float transientPenalty = std::clamp (p.transientActivity, 0.0f, 1.0f)
+                                           * std::clamp (p.transientGuard, 0.0f, 1.0f) * 5.0f;
+                    if (transientPenalty > 0.0f)
+                    {
+                        excess = std::max(0.0f, excess - transientPenalty);
+                    }
+                }
 
                 if (p.hardMode && excess > 0.0f)
                 {
@@ -397,7 +409,7 @@ namespace ResonaPro
 
                 // Note Motion protection (low registers only):
                 if (p.motionProtect > 0.0f && historyValid && previousPeriod >= 3.0f
-                    && periodSmooth >= 3.0f && binFreq[static_cast<size_t> (k)] < 1500.0f)
+                    && periodSmooth >= 3.0f && fHz < 1500.0f)
                 {
                     const float oldBin = k * previousPeriod / periodSmooth;
                     if (std::abs (oldBin - k) >= 1.0f && oldBin > 1.0f && oldBin < bins - 2)

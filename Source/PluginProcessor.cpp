@@ -12,7 +12,7 @@ namespace ResonaPro
 
         const float kDefaultEqFreq[8] = { 80.0f, 250.0f, 500.0f, 1200.0f, 3200.0f, 6000.0f, 9000.0f, 14000.0f };
         const float kDefaultEqQ[8]    = { 0.707f, 1.0f, 1.2f, 1.2f, 1.4f, 1.5f, 1.6f, 0.707f };
-        const int   kDefaultEqType[8] = { 1, 0, 0, 0, 0, 0, 0, 2 };
+        const int   kDefaultEqType[8] = { 3, 0, 0, 0, 0, 0, 0, 4 };
     }
 
     //==============================================================================

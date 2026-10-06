@@ -113,14 +113,14 @@ namespace ResonaPro
         ParametricEQWeighting()
         {
             // All bands start at 0.0 dB => completely neutral weighting (zero reduction everywhere).
-            bands[0] = { true, FilterType::LowCut,     80.0f,   0.0f, 0.707f };
+            bands[0] = { true, FilterType::LowShelf,   80.0f,   0.0f, 0.707f };
             bands[1] = { true, FilterType::Bell,      250.0f,   0.0f, 1.0f   };
             bands[2] = { true, FilterType::Bell,      500.0f,   0.0f, 1.2f   };
             bands[3] = { true, FilterType::Bell,     1200.0f,   0.0f, 1.2f   };
             bands[4] = { true, FilterType::Bell,     3200.0f,   0.0f, 1.4f   };
             bands[5] = { true, FilterType::Bell,     6000.0f,   0.0f, 1.5f   };
             bands[6] = { true, FilterType::Bell,     9000.0f,   0.0f, 1.6f   };
-            bands[7] = { true, FilterType::HighCut,  16000.0f,   0.0f, 0.707f };
+            bands[7] = { true, FilterType::HighShelf, 16000.0f,   0.0f, 0.707f };
         }
 
         void setBand (int index, FilterType type, float freq, float gainDb, float q, bool enabled = true)
