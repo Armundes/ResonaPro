@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Build directories & scratch
+build/
+.work/
+cmake-build-*/
+outputs/
+Binaries/
+
+# Debug symbols & IDE files
+*.dSYM/
+*.suo
+*.user
+*.user.*
+.idea/
+.vscode/
+
+# JUCE temp build files
+JUCE_build/
