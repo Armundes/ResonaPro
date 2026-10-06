@@ -361,9 +361,11 @@ namespace ResonaPro
                     thr -= (4.0f * p.sibilanceSmooth);
                 }
 
-                // Lower the threshold slightly based on the cue to grab more resonance, 
-                // but cap it so we don't start suppressing the raw noise floor.
-                thr -= std::min(effectiveCue * 0.5f, 5.0f);
+                // RULE 2: AGGRESSIVE THRESHOLD LOWERING FOR CUES
+                // If the user pushes a cue high, they are demanding reduction.
+                // We drop the threshold proportionally without a hard cap so that
+                // it can catch smooth high-end energy (not just sharp peaks).
+                thr -= (effectiveCue * 0.85f);
 
                 float rawExcess = prominenceDb[static_cast<size_t> (k)] - thr;
                 if (rawExcess <= 0.0f)
