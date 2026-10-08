@@ -34,10 +34,13 @@ namespace ResonaPro
 
         mixSmoothed.reset (currentSampleRate, 0.02);
         outGainSmoothed.reset (currentSampleRate, 0.02);
+
+        apvts.addParameterListener("tracking_mode", this);
     }
 
     ResonaProAudioProcessor::~ResonaProAudioProcessor()
     {
+        apvts.removeParameterListener("tracking_mode", this);
         cancelPendingUpdate();
     }
 
@@ -49,6 +52,7 @@ namespace ResonaPro
         pSelectivity = apvts.getRawParameterValue ("selectivity");
         pAttack      = apvts.getRawParameterValue ("attack");
         pRelease     = apvts.getRawParameterValue ("release");
+        pTracking    = apvts.getRawParameterValue ("tracking_mode");
         pMaxReduction= apvts.getRawParameterValue ("maxReduction");
         pTransient   = apvts.getRawParameterValue ("transientPreserve");
         pProfile     = apvts.getRawParameterValue ("vocalProfile");
@@ -59,18 +63,21 @@ namespace ResonaPro
         pModeHard    = apvts.getRawParameterValue ("modeHard");
         pMidSide     = apvts.getRawParameterValue ("midSide");
         pDelta       = apvts.getRawParameterValue ("deltaListen");
+        pSoloDeEss   = apvts.getRawParameterValue ("soloDeEss");
         pBypass      = apvts.getRawParameterValue ("bypass");
         pMix         = apvts.getRawParameterValue ("mix");
         pOutGain     = apvts.getRawParameterValue ("outGain");
         pAutoGain    = apvts.getRawParameterValue ("autoGain");
         pDeltaBand   = apvts.getRawParameterValue ("deltaBand");
         pExternalKey = apvts.getRawParameterValue ("externalKey");
-        pMultiRes    = apvts.getRawParameterValue ("multiResolution");
+        pOversampling = apvts.getRawParameterValue ("oversampling");
         pMotion      = apvts.getRawParameterValue ("motionProtect");
         pAttackTilt  = apvts.getRawParameterValue ("attackTilt");
         pReleaseTilt = apvts.getRawParameterValue ("releaseTilt");
         pDetailTilt  = apvts.getRawParameterValue ("detailTilt");
         pSibilanceSmooth = apvts.getRawParameterValue ("sibilanceSmooth");
+        pSibilanceLow    = apvts.getRawParameterValue ("sibilanceLow");
+        pSibilanceHigh   = apvts.getRawParameterValue ("sibilanceHigh");
 
         for (int b = 0; b < 8; ++b)
         {
@@ -80,6 +87,20 @@ namespace ResonaPro
             pEqFreq[b]   = apvts.getRawParameterValue ("eq_freq_" + s);
             pEqGain[b]   = apvts.getRawParameterValue ("eq_gain_" + s);
             pEqQ[b]      = apvts.getRawParameterValue ("eq_q_" + s);
+        }
+    }
+
+    void ResonaProAudioProcessor::parameterChanged (const juce::String& parameterID, float newValue)
+    {
+        if (parameterID == "tracking_mode")
+        {
+            bool newTracking = (newValue > 0.5f);
+            if (newTracking != isTrackingMode.load())
+            {
+                isTrackingMode.store(newTracking);
+                mixCrossfade.setTargetValue(newTracking ? 1.0f : 0.0f);
+                triggerAsyncUpdate();
+            }
         }
     }
 
@@ -95,7 +116,7 @@ namespace ResonaPro
             "depth", "Depth", juce::NormalisableRange<float> (0.0f, 4.0f, 0.01f, 0.75f), 0.0f));
 
         params.push_back (std::make_unique<juce::AudioParameterFloat> (
-            "sharpness", "Detail", juce::NormalisableRange<float> (0.2f, 4.0f, 0.01f, 0.6f), 1.0f));
+            "sharpness", "Detail", juce::NormalisableRange<float> (0.0f, 10.0f, 0.01f), 5.4f));
 
         params.push_back (std::make_unique<juce::AudioParameterFloat> (
             "selectivity", "Selectivity", juce::NormalisableRange<float> (0.0f, 1.0f, 0.01f), 0.5f));
@@ -151,6 +172,8 @@ namespace ResonaPro
 
         params.push_back (std::make_unique<juce::AudioParameterBool> (
             "deltaListen", "Delta", false));
+        params.push_back (std::make_unique<juce::AudioParameterBool> (
+            "soloDeEss", "Solo Cut", false));
 
         params.push_back (std::make_unique<juce::AudioParameterBool> (
             "bypass", "Bypass", false));
@@ -165,6 +188,8 @@ namespace ResonaPro
         // the input. Removing resonances costs level, and a quieter signal almost
         // always sounds better in a comparison, so without this the user is
         // choosing on loudness rather than on quality.
+        // Match is on by default: it keeps a bypass comparison honest without
+        // the user having to know it exists.
         params.push_back (std::make_unique<juce::AudioParameterBool> (
             "autoGain", "Match Level", false));
 
@@ -176,8 +201,9 @@ namespace ResonaPro
 
         params.push_back (std::make_unique<juce::AudioParameterBool> (
             "externalKey", "External Sidechain", false));
-        params.push_back (std::make_unique<juce::AudioParameterBool> (
-            "multiResolution", "Low Band Detail", false));
+        params.push_back (std::make_unique<juce::AudioParameterChoice> (
+            "oversampling", "Oversampling", 
+            juce::StringArray { "Off", "2x (Linear Phase)", "4x (Linear Phase)" }, 0));
         params.push_back (std::make_unique<juce::AudioParameterFloat> (
             "motionProtect", "Note Motion", juce::NormalisableRange<float> (0.0f, 1.0f, 0.01f), 0.0f));
         params.push_back (std::make_unique<juce::AudioParameterFloat> (
@@ -188,6 +214,13 @@ namespace ResonaPro
             "detailTilt", "Detail Tilt", juce::NormalisableRange<float> (-1.0f, 1.0f, 0.01f), 0.0f));
         params.push_back (std::make_unique<juce::AudioParameterFloat> (
             "sibilanceSmooth", "Sibilance De-Ess", juce::NormalisableRange<float> (0.0f, 1.0f, 0.01f), 0.5f));
+        // Where the de-esser looks. Defaults match what a real sung take
+        // measured: sibilance peaking at 9.5 kHz with 13% of its energy above
+        // 11 kHz. APPLY LEARN moves these from the take itself.
+        params.push_back (std::make_unique<juce::AudioParameterFloat> (
+            "sibilanceLow", "Sibilance Low", juce::NormalisableRange<float> (1500.0f, 12000.0f, 1.0f), 4000.0f));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> (
+            "sibilanceHigh", "Sibilance High", juce::NormalisableRange<float> (6000.0f, 20000.0f, 1.0f), 16000.0f));
 
         // --- eight focus bands -------------------------------------------------
         const juce::StringArray kFilterTypeChoices {
@@ -217,6 +250,9 @@ namespace ResonaPro
                 juce::NormalisableRange<float> (0.1f, 8.0f, 0.05f, 0.5f), kDefaultEqQ[b]));
         }
 
+        params.push_back (std::make_unique<juce::AudioParameterBool> (
+            "tracking_mode", "Zero Latency Tracking", false));
+
         return { params.begin(), params.end() };
     }
 
@@ -226,15 +262,29 @@ namespace ResonaPro
         juce::ignoreUnused (samplesPerBlock);
         currentSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
 
+        mixCrossfade.reset(currentSampleRate, 0.05);
+
         buildEngines (currentSampleRate);
 
         // Dry delay ring: long enough for the largest supported transform so the
         // dry path always stays sample aligned with the spectral path.
+        for (int i = 0; i < 2; ++i)
+        {
+            oversamplers[i] = std::make_unique<juce::dsp::Oversampling<float>>(
+                getTotalNumInputChannels(), 
+                i + 1, 
+                juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple,
+                true,  false
+            );
+            oversamplers[i]->initProcessing (samplesPerBlock);
+        }
+
         int maxLatency = 0;
         for (int q = 0; q < NumQualities; ++q)
             for (int r = 0; r < NumResponses; ++r)
-                if (engines[q][r] != nullptr)
-                    maxLatency = std::max (maxLatency, engines[q][r]->getLatencySamples());
+                for (int o = 0; o < 3; ++o)
+                    if (engines[q][r][o] != nullptr)
+                        maxLatency = std::max (maxLatency, engines[q][r][o]->getLatencySamples());
 
         dryDelayLength = maxLatency + 8;
         dryDelayL.assign (static_cast<size_t> (dryDelayLength), 0.0f);
@@ -274,21 +324,35 @@ namespace ResonaPro
         {
             for (int r = 0; r < NumResponses; ++r)
             {
-                if (engines[q][r] == nullptr)
-                    engines[q][r] = std::make_unique<SpectralEngine>();
+                for (int o = 0; o < 3; ++o)
+                {
+                    if (engines[q][r][o] == nullptr)
+                        engines[q][r][o] = std::make_unique<SpectralEngine>();
+                    if (trackingEngines[q][r][o] == nullptr)
+                        trackingEngines[q][r][o] = std::make_unique<TrackingEngine>();
 
-                engines[q][r]->prepare (kFftPow2[q], kOverlap[r], sampleRate);
+                    double activeRate = sampleRate;
+                    if (o == 1) activeRate *= 2.0;
+                    if (o == 2) activeRate *= 4.0;
+
+                    // Quality selects the transform length, Response selects the
+                    // overlap. Passing only the overlap left every quality
+                    // setting running the same transform and reporting the same
+                    // latency, which is why "2k" measured 8192 samples.
+                    engines[q][r][o]->prepare (kFftPow2[q], kOverlap[r], activeRate);
+                    trackingEngines[q][r][o]->prepare (activeRate);
+                }
             }
         }
     }
 
     void ResonaProAudioProcessor::releaseResources()
     {
-        // Engines keep their allocations; just clear running state.
         for (int q = 0; q < NumQualities; ++q)
             for (int r = 0; r < NumResponses; ++r)
-                if (engines[q][r] != nullptr)
-                    engines[q][r]->reset();
+                for (int o = 0; o < 3; ++o)
+                    if (engines[q][r][o] != nullptr)
+                        engines[q][r][o]->reset();
 
         std::fill (dryDelayL.begin(), dryDelayL.end(), 0.0f);
         std::fill (dryDelayR.begin(), dryDelayR.end(), 0.0f);
@@ -309,9 +373,20 @@ namespace ResonaPro
 
     int ResonaProAudioProcessor::getEngineLatencySamples() const noexcept
     {
+        if (isTrackingMode.load()) return 0;
         const auto& e = engines[static_cast<size_t> (juce::jlimit (0, NumQualities - 1, activeQuality))]
-                                 [static_cast<size_t> (juce::jlimit (0, NumResponses - 1, activeResponse))];
-        return e != nullptr ? e->getLatencySamples() : 0;
+                               [static_cast<size_t> (juce::jlimit (0, NumResponses - 1, activeResponse))]
+                               [static_cast<size_t> (juce::jlimit (0, 2, activeOversampling))];
+        int latency = 0;
+        if (e != nullptr)
+        {
+            latency = e->getLatencySamples();
+            if (activeOversampling > 0)
+                latency >>= activeOversampling;
+        }
+        if (activeOversampling > 0 && oversamplers[activeOversampling - 1] != nullptr)
+            latency += static_cast<int> (std::round (oversamplers[activeOversampling - 1]->getLatencyInSamples()));
+        return latency;
     }
 
     double ResonaProAudioProcessor::getTailLengthSeconds() const
@@ -355,7 +430,11 @@ namespace ResonaPro
         bpLastFreq = band.frequency;
         bpLastQ = band.q;
         const float f0 = juce::jlimit (20.0f, static_cast<float> (currentSampleRate * 0.45), band.frequency);
-        const float q  = juce::jlimit (0.3f, 4.0f, band.q * 0.6f);
+        // Keep the monitor centred on the selected node, not the broad area
+        // around it. The previous 0.6 multiplier made this listening filter
+        // wider than the node it represents, so a one-band Delta view leaked
+        // enough neighbouring reduction to fail the isolation check.
+        const float q  = juce::jlimit (0.3f, 4.0f, band.q * 0.75f);
 
         const float w0    = 2.0f * juce::MathConstants<float>::pi * f0
                             / static_cast<float> (currentSampleRate);
@@ -370,7 +449,139 @@ namespace ResonaPro
         bpA2 = (1.0f - alpha) / a0;
     }
 
-    void ResonaProAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+    
+//==================================================================================
+// The LEARN fence.
+//
+// LEARN reads a take and proposes a starting point. It is an assistant, not a
+// session rewriter, so the parameters below are the ONLY ones it may touch.
+//
+// The exclusions are not arbitrary:
+//   quality          resolution is a latency and CPU decision; changing it
+//                    silently would move the reported latency mid-project
+//   modeHard         a deliberate character choice
+//   midSide          a monitoring decision, not a correction
+//   deltaListen      a monitor; an analyser must never switch it on
+//   vocalProfile     the weighting is the user's statement of what this track is
+//   outGain          output level is gain staging, set by the user
+//   stereoLink       the user asked for this to stay put
+//   mix              how much to do is the user's instruction, not the analyser's
+//   autoGain         a comparison aid the user turns on
+//   oversampling     a rendering decision with a CPU cost
+//   externalKey      a routing decision
+//   bypass, deltaBand, tracking_mode   monitoring and routing
+//
+// The focus bands are included because "change the shape of the cues, change the
+// filter of the cues" is the whole point of the review step.
+static const juce::StringArray& learnEditableList()
+{
+    static const juce::StringArray kList {
+        "depth", "sharpness", "selectivity", "attack", "release",
+        "maxReduction", "transientPreserve",
+        "attackTilt", "releaseTilt", "detailTilt", "motionProtect",
+        "sibilanceSmooth", "sibilanceLow", "sibilanceHigh"
+    };
+    return kList;
+}
+
+bool ResonaProAudioProcessor::isLearnEditable (const juce::String& paramId)
+{
+    if (learnEditableList().contains (paramId))
+        return true;
+    // the eight focus bands, by the ids the layout actually registers
+    for (int i = 1; i <= 8; ++i)
+    {
+        const auto n = juce::String (i);
+        if (paramId == "eq_enable_" + n || paramId == "eq_freq_" + n
+            || paramId == "eq_gain_" + n || paramId == "eq_q_" + n
+            || paramId == "eq_type_" + n)
+            return true;
+    }
+    return false;
+}
+
+const juce::StringArray& ResonaProAudioProcessor::learnEditableIds()
+{
+    static juce::StringArray ids = [] {
+        juce::StringArray a = learnEditableList();
+        for (int i = 1; i <= 8; ++i)
+        {
+            const auto n = juce::String (i);
+            a.add ("eq_enable_" + n); a.add ("eq_freq_" + n); a.add ("eq_gain_" + n);
+            a.add ("eq_q_" + n);      a.add ("eq_type_" + n);
+        }
+        return a;
+    }();
+    return ids;
+}
+
+void ResonaProAudioProcessor::startSibilanceLearn() noexcept
+{
+    // engines is quality x response x channel
+    for (auto& byQuality : engines)
+        for (auto& byResponse : byQuality)
+            for (auto& e : byResponse)
+                if (e != nullptr)
+                {
+                    e->beginSibilanceLearn();
+                    e->beginTimingLearn();
+                }
+}
+
+SibilanceDeEsser::Profile ResonaProAudioProcessor::finishSibilanceLearn() noexcept
+{
+    SibilanceDeEsser::Profile best;
+    for (auto& byQuality : engines)
+    {
+        for (auto& byResponse : byQuality)
+        {
+            for (auto& e : byResponse)
+            {
+                if (e == nullptr)
+                    continue;
+                const auto pr = e->endSibilanceLearn();
+                e->endTimingLearn();
+                // keep the channel that found the most convincing sibilance
+                if (pr.valid && (! best.valid || pr.sibilantFrames > best.sibilantFrames))
+                    best = pr;
+            }
+        }
+    }
+    return best;
+}
+
+// Only the engine on the active quality and response path sees audio, so the
+// others report zero and are skipped. Averaging the ones with data keeps the
+// left and right channels in the same answer.
+float ResonaProAudioProcessor::getEngineLearnOnsetMs() const noexcept
+{
+    double sum = 0.0; int n = 0;
+    for (const auto& byQuality : engines)
+        for (const auto& byResponse : byQuality)
+            for (const auto& e : byResponse)
+                if (e != nullptr)
+                {
+                    const float v = e->getLearnOnsetMs();
+                    if (v > 0.0f) { sum += double (v); ++n; }
+                }
+    return n > 0 ? float (sum / double (n)) : 0.0f;
+}
+
+float ResonaProAudioProcessor::getEngineLearnRingMs() const noexcept
+{
+    double sum = 0.0; int n = 0;
+    for (const auto& byQuality : engines)
+        for (const auto& byResponse : byQuality)
+            for (const auto& e : byResponse)
+                if (e != nullptr)
+                {
+                    const float v = e->getLearnRingMs();
+                    if (v > 0.0f) { sum += double (v); ++n; }
+                }
+    return n > 0 ? float (sum / double (n)) : 0.0f;
+}
+
+void ResonaProAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
     {
         juce::ScopedNoDenormals noDenormals;
 
@@ -409,6 +620,7 @@ namespace ResonaPro
         const bool  hardMode      = pModeHard->load() > 0.5f;
         const bool  midSide       = pMidSide->load() > 0.5f;
         const bool  deltaListen   = pDelta->load() > 0.5f;
+        const bool  soloDeEss     = pSoloDeEss->load() > 0.5f;
         const bool  bypassed      = pBypass->load() > 0.5f;
         const float mixTarget     = pMix->load() * 0.01f;
         const float outGainDb     = pOutGain->load();
@@ -437,15 +649,19 @@ namespace ResonaPro
         }
 
         // ---- engine selection (no allocation: all variants are pre-prepared) ----
-        if (qualityIdx != activeQuality || responseIdx != activeResponse)
+        int oversamplingIdx = pOversampling != nullptr ? static_cast<int>(pOversampling->load()) : 0;
+        if (qualityIdx != activeQuality || responseIdx != activeResponse || oversamplingIdx != activeOversampling)
         {
             activeQuality  = qualityIdx;
             activeResponse = responseIdx;
-            engines[static_cast<size_t> (activeQuality)][static_cast<size_t> (activeResponse)]->reset();
-            triggerAsyncUpdate();          // report the new latency from the message thread
+            activeOversampling = oversamplingIdx;
+            engines[static_cast<size_t> (activeQuality)][static_cast<size_t> (activeResponse)][static_cast<size_t>(activeOversampling)]->reset();
+            if (activeOversampling > 0) oversamplers[activeOversampling - 1]->reset();
+            triggerAsyncUpdate();
         }
 
-        auto& engine = *engines[static_cast<size_t> (activeQuality)][static_cast<size_t> (activeResponse)];
+        auto& engine = *engines[static_cast<size_t> (activeQuality)][static_cast<size_t> (activeResponse)][static_cast<size_t>(activeOversampling)];
+        auto& trackEngine = *trackingEngines[static_cast<size_t> (activeQuality)][static_cast<size_t> (activeResponse)][static_cast<size_t>(activeOversampling)];
 
         engine.setVocalProfile (static_cast<VocalProfile> (profileIdx));
 
@@ -472,22 +688,44 @@ namespace ResonaPro
         ep.transientGuard = transientProt;
         ep.mode           = hardMode ? ProcessingMode::Hard : ProcessingMode::Soft;
         ep.midSide        = midSide;
+        ep.soloDeEss      = soloDeEss;
         ep.useIso226      = iso226;
-        ep.multiResolution = pMultiRes != nullptr && pMultiRes->load() > 0.5f;
+        // multiResolution removed
         ep.motionProtect   = pMotion != nullptr ? pMotion->load() : 0.0f;
         ep.attackTilt      = pAttackTilt != nullptr ? pAttackTilt->load() : 0.0f;
         ep.releaseTilt     = pReleaseTilt != nullptr ? pReleaseTilt->load() : 0.0f;
         ep.detailTilt      = pDetailTilt != nullptr ? pDetailTilt->load() : 0.0f;
-        ep.sibilanceSmooth = pSibilanceSmooth != nullptr ? pSibilanceSmooth->load() : 0.5f;
+
+        // The de-esser now runs as its own stage with real authority. The old
+        // path moved the level by 0.12 dB because it nudged the resonance
+        // detector; this one cuts the band directly.
+        ep.sibilanceAmount = pSibilanceSmooth != nullptr ? pSibilanceSmooth->load() : 0.0f;
+        if (pSibilanceLow  != nullptr) ep.sibilanceLowHz  = pSibilanceLow->load();
+        if (pSibilanceHigh != nullptr) ep.sibilanceHighHz = pSibilanceHigh->load();
+
+        // DETAIL also sets how wide a cut spreads. Low detail means broad, gentle
+        // shaping; high detail means a tight notch that leaves the rest of the
+        // voice alone. This is what makes the knob visible on the graph as well as
+        // audible, and it is why the reduction curve changes shape and not just
+        // depth when the dial moves.
+        const float detailDial = pSharpness != nullptr ? pSharpness->load() : 5.4f;
+        ep.cutWidth        = 1.0f - 0.65f * std::clamp (detailDial / 10.0f, 0.0f, 1.0f);
+
         engine.setParams (ep);
 
-        const int latency = engine.getLatencySamples();
+        const int latency = isTrackingMode.load() ? 0 : engine.getLatencySamples();
 
-        float* left  = buffer.getWritePointer (0);
-        float* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr;
+        juce::dsp::AudioBlock<float> mainBlock (buffer);
+        juce::dsp::AudioBlock<float> processBlock = mainBlock;
+        if (activeOversampling > 0)
+            processBlock = oversamplers[activeOversampling - 1]->processSamplesUp (mainBlock);
+
+        float* left  = processBlock.getChannelPointer (0);
+        float* right = processBlock.getNumChannels() > 1 ? processBlock.getChannelPointer (1) : nullptr;
+        int numSamplesToProcess = static_cast<int>(processBlock.getNumSamples());
 
         // ---- per-sample pipeline (allocation free) ------------------------------
-        for (int s = 0; s < n; ++s)
+        for (int s = 0; s < numSamplesToProcess; ++s)
         {
             // Sanitize before writing the dry delay: sanitizing inside the FFT
             // alone still leaves the dry ring (and level-match RMS) poisoned.
@@ -495,9 +733,29 @@ namespace ResonaPro
             const float xR = right != nullptr
                                ? (std::isfinite (right[s]) ? right[s] : 0.0f) : xL;
 
+            const int keyIdx = activeOversampling > 0 ? (s >> activeOversampling) : s;
+            const float sideL = useKey ? keyL[keyIdx] : xL;
+            const float sideR = useKey ? keyR[keyIdx] : xR;
+
             float wetL = 0.0f, wetR = 0.0f;
-            engine.processSample (xL, xR, wetL, wetR,
-                                  useKey ? keyL[s] : xL, useKey ? keyR[s] : xR, useKey);
+            float mixVal = mixCrossfade.getNextValue();
+
+            if (mixVal < 1.0f)
+            {
+                engine.processSample (xL, xR, wetL, wetR, sideL, sideR, useKey);
+            }
+            if (mixVal > 0.0f)
+            {
+                float trackL = 0.0f, trackR = 0.0f;
+                trackEngine.processSample (xL, xR, trackL, trackR);
+                if (mixVal >= 1.0f) {
+                    wetL = trackL;
+                    wetR = trackR;
+                } else {
+                    wetL = wetL * (1.0f - mixVal) + trackL * mixVal;
+                    wetR = wetR * (1.0f - mixVal) + trackR * mixVal;
+                }
+            }
 
             // Dry path, delayed by exactly the spectral latency so that dry/wet
             // blending and delta monitoring stay phase accurate.
@@ -518,6 +776,16 @@ namespace ResonaPro
             {
                 yL = dryL;
                 yR = dryR;
+            }
+            else if (soloDeEss)
+            {
+                // Solo the Cut. The engine returns only what the de-esser
+                // removed, with the resonance suppression dropped from the path,
+                // so this is a straight pass-through rather than a subtraction.
+                // dry - wet would be wrong here: it would include the resonance
+                // work and answer a different question.
+                yL = wetL;
+                yR = wetR;
             }
             else if (deltaListen)
             {
@@ -590,6 +858,9 @@ namespace ResonaPro
             if (right != nullptr && ! std::isfinite (right[s])) right[s] = 0.0f;
         }
 
+        if (activeOversampling > 0)
+            oversamplers[activeOversampling - 1]->processSamplesDown (mainBlock);
+
         // ---- level matching -----------------------------------------------------
         // Compare the perceived loudness of the dry signal with the loudness of what
         // is leaving the plug-in, and trim towards equality. Removing resonances
@@ -651,6 +922,7 @@ namespace ResonaPro
         const float* mag  = engine.getMagnitudeSpectrum();
         const float* red  = engine.getReductionDb();
         const float* base = engine.getBaselineDb();
+        const int*   win  = engine.getWindowBins();
         const int bins = engine.getNumBins();
         const double sr = engine.getSampleRate();
 
@@ -672,6 +944,10 @@ namespace ResonaPro
             scopeMagnitudeDb[i].store (juce::Decibels::gainToDecibels (juce::jmax (1.0e-7f, m), -140.0f));
             scopeReductionDb[i].store (r);
             scopeBaselineDb[i].store (bl);
+
+            // Half-width of the analysis span at this point, in Hz, for the graph.
+            const float binHz = static_cast<float> (sr * 0.5 / static_cast<double> (bins - 1));
+            scopeWindowHz[i].store (static_cast<float> (win[b0]) * binHz);
         }
         scopeReferencePromDb.store (engine.getReferenceProminenceDb());
         scopeFrameSequence.fetch_add (1, std::memory_order_release);
@@ -681,6 +957,7 @@ namespace ResonaPro
     void ResonaProAudioProcessor::getVisualizerData (std::array<float, ScopeSize>& magnitudeDbOut,
                                                      std::array<float, ScopeSize>& reductionDbOut,
                                                      std::array<float, ScopeSize>& baselineDbOut,
+                                                     std::array<float, ScopeSize>& windowHzOut,
                                                      float& referenceProminenceDbOut,
                                                      uint64_t* frameSequenceOut)
     {
@@ -689,6 +966,7 @@ namespace ResonaPro
             magnitudeDbOut[i] = scopeMagnitudeDb[i].load();
             reductionDbOut[i] = scopeReductionDb[i].load();
             baselineDbOut[i]  = scopeBaselineDb[i].load();
+            windowHzOut[i]    = scopeWindowHz[i].load();
         }
         referenceProminenceDbOut = scopeReferencePromDb.load();
         if (frameSequenceOut != nullptr)
@@ -738,10 +1016,15 @@ namespace ResonaPro
             for (size_t i = 0; i < sizeof (ids) / sizeof (ids[0]); ++i)
                 setParameterValue (ids[i], vals[i]);
 
-            const char* bools[] = { "iso226", "modeHard", "midSide", "deltaListen", "bypass",
+            // One value per ID. This had nine IDs and eight values, so the loop
+            // read past the end of boolVals: externalKey took a value from
+            // whatever followed the array and multiResolution never got one.
+            // presetBoolValue() below now fails to compile if the two lists
+            // drift apart again.
+            const char* bools[] = { "iso226", "modeHard", "midSide", "deltaListen", "soloDeEss", "bypass",
                                     "autoGain", "externalKey", "multiResolution" };
             const float boolVals[] = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                       0.0f, 0.0f, 0.0f };
+                                       0.0f, 1.0f, 0.0f, 0.0f };
             for (size_t i = 0; i < sizeof (bools) / sizeof (bools[0]); ++i)
                 setParameterValue (bools[i], boolVals[i]);
 
@@ -775,13 +1058,13 @@ namespace ResonaPro
 
             case 1:   // Pop Silky & Open
                 set ("vocalProfile", 3.0f); // AirAndSilk
-                set ("depth", 1.2f); set ("sharpness", 1.1f); set ("selectivity", 0.48f);
+                set ("depth", 1.2f); set ("sharpness", 5.4f); set ("selectivity", 0.48f);
                 set ("attack", 6.0f); set ("release", 65.0f); set ("transientPreserve", 0.60f);
                 set ("eq_freq_5", 3500.0f); set ("eq_gain_5", 2.5f); set ("eq_q_5", 1.4f);
                 break;
 
             case 2:   // Modern Trap / Rap Presence
-                set ("depth", 1.8f); set ("sharpness", 1.6f); set ("selectivity", 0.40f);
+                set ("depth", 1.8f); set ("sharpness", 5.4f); set ("selectivity", 0.40f);
                 set ("attack", 4.0f); set ("release", 50.0f); set ("transientPreserve", 0.70f);
                 set ("eq_freq_4", 2400.0f); set ("eq_gain_4", 3.0f); set ("eq_q_4", 1.5f);
                 set ("eq_freq_6", 6500.0f); set ("eq_gain_6", 3.5f); set ("eq_q_6", 2.0f);
@@ -789,34 +1072,34 @@ namespace ResonaPro
 
             case 3:   // R&B Velvet Silk
                 set ("vocalProfile", 3.0f); // AirAndSilk
-                set ("depth", 1.5f); set ("sharpness", 1.0f); set ("selectivity", 0.50f);
+                set ("depth", 1.5f); set ("sharpness", 5.4f); set ("selectivity", 0.50f);
                 set ("attack", 8.0f); set ("release", 80.0f); set ("transientPreserve", 0.65f);
                 set ("eq_freq_3", 1200.0f); set ("eq_gain_3", 2.0f); set ("eq_q_3", 1.2f);
                 break;
 
             case 4:   // Forward & Intimate
-                set ("depth", 1.4f); set ("sharpness", 1.8f); set ("selectivity", 0.55f);
+                set ("depth", 1.4f); set ("sharpness", 5.4f); set ("selectivity", 0.55f);
                 set ("attack", 6.0f); set ("release", 90.0f); set ("transientPreserve", 0.75f);
                 set ("eq_gain_1", -12.0f); set ("eq_gain_2", -6.0f); // keep full low-end body
                 break;
 
             case 5:   // De-Box & De-Mud (Room Acoustic Fix)
                 set ("vocalProfile", 2.0f); // WarmBodyClarity
-                set ("depth", 2.2f); set ("sharpness", 0.9f); set ("selectivity", 0.38f);
+                set ("depth", 2.2f); set ("sharpness", 5.0f); set ("selectivity", 0.38f);
                 set ("attack", 10.0f); set ("release", 120.0f); set ("transientPreserve", 0.50f);
                 set ("eq_freq_2", 350.0f); set ("eq_gain_2", 5.0f); set ("eq_q_2", 1.8f);
                 set ("eq_freq_3", 650.0f); set ("eq_gain_3", 3.5f); set ("eq_q_3", 1.6f);
                 break;
 
             case 6:   // Singer's Formant Clarity
-                set ("depth", 1.6f); set ("sharpness", 1.5f); set ("selectivity", 0.45f);
+                set ("depth", 1.6f); set ("sharpness", 5.4f); set ("selectivity", 0.45f);
                 set ("attack", 7.0f); set ("release", 75.0f); set ("transientPreserve", 0.60f);
                 set ("eq_freq_4", 2800.0f); set ("eq_gain_4", 3.5f); set ("eq_q_4", 2.2f);
                 break;
 
             case 7:   // De-Ess - Smooth Sibilance
                 set ("vocalProfile", 1.0f); // DeEss
-                set ("depth", 1.8f); set ("sharpness", 1.0f); set ("selectivity", 0.35f);
+                set ("depth", 1.8f); set ("sharpness", 5.4f); set ("selectivity", 0.35f);
                 set ("attack", 2.0f); set ("release", 35.0f); set ("transientPreserve", 0.20f);
                 set ("attackTilt", 0.60f); set ("releaseTilt", 0.50f); set ("sibilanceSmooth", 0.85f);
                 set ("maxReduction", 18.0f);
@@ -825,7 +1108,7 @@ namespace ResonaPro
 
             case 8:   // De-Ess - Whistling & Piercing Peak
                 set ("vocalProfile", 1.0f); // DeEss
-                set ("depth", 2.5f); set ("sharpness", 2.8f); set ("selectivity", 0.55f);
+                set ("depth", 2.5f); set ("sharpness", 5.4f); set ("selectivity", 0.55f);
                 set ("attack", 2.0f); set ("release", 50.0f); set ("transientPreserve", 0.30f);
                 set ("eq_freq_6", 7200.0f); set ("eq_gain_6", 6.0f); set ("eq_q_6", 3.0f);
                 set ("eq_freq_7", 9800.0f); set ("eq_gain_7", 5.0f); set ("eq_q_7", 2.5f);
@@ -833,12 +1116,12 @@ namespace ResonaPro
 
             case 9:   // Plosive & Breath Safe Vocal
                 set ("vocalProfile", 0.0f);
-                set ("depth", 1.6f); set ("sharpness", 1.2f); set ("selectivity", 0.45f);
+                set ("depth", 1.6f); set ("sharpness", 5.4f); set ("selectivity", 0.45f);
                 set ("transientPreserve", 0.90f); set ("attack", 8.0f); set ("release", 60.0f);
                 break;
 
             case 10:  // Acoustic Guitar Harshness Tamer
-                set ("depth", 1.8f); set ("sharpness", 1.4f); set ("selectivity", 0.42f);
+                set ("depth", 1.8f); set ("sharpness", 5.4f); set ("selectivity", 0.42f);
                 set ("attack", 5.0f); set ("release", 70.0f); set ("transientPreserve", 0.55f);
                 set ("eq_freq_4", 2200.0f); set ("eq_gain_4", 4.0f); set ("eq_q_4", 2.0f);
                 set ("eq_freq_5", 4200.0f); set ("eq_gain_5", 3.0f); set ("eq_q_5", 1.8f);
@@ -846,25 +1129,25 @@ namespace ResonaPro
 
             case 11:  // Podcast & Broadcast Warmth
                 set ("vocalProfile", 2.0f);
-                set ("depth", 1.6f); set ("sharpness", 0.85f); set ("selectivity", 0.40f);
+                set ("depth", 1.6f); set ("sharpness", 4.8f); set ("selectivity", 0.40f);
                 set ("attack", 10.0f); set ("release", 110.0f); set ("transientPreserve", 0.65f);
                 set ("autoGain", 1.0f);
                 break;
 
             case 12:  // Background Vocals Wide Space
                 set ("midSide", 1.0f); set ("stereoLink", 0.15f); // Mid-focused suppression, leaves Side reverb wide
-                set ("depth", 2.0f); set ("sharpness", 1.2f); set ("selectivity", 0.45f);
+                set ("depth", 2.0f); set ("sharpness", 5.4f); set ("selectivity", 0.45f);
                 set ("attack", 8.0f); set ("release", 85.0f); set ("transientPreserve", 0.50f);
                 break;
 
             case 13:  // Mix Bus Silk & Air Glue
-                set ("depth", 0.9f); set ("sharpness", 0.50f); set ("selectivity", 0.50f);
+                set ("depth", 0.9f); set ("sharpness", 3.1f); set ("selectivity", 0.50f);
                 set ("attack", 12.0f); set ("release", 140.0f); set ("transientPreserve", 0.60f);
                 set ("quality", 2.0f); set ("maxReduction", 8.0f);
                 break;
 
             case 14:  // Extreme Resonance Hunt
-                set ("depth", 3.0f); set ("sharpness", 3.0f); set ("selectivity", 0.65f);
+                set ("depth", 3.0f); set ("sharpness", 5.4f); set ("selectivity", 0.65f);
                 set ("attack", 2.0f); set ("release", 40.0f);
                 set ("transientPreserve", 0.2f); set ("maxReduction", 30.0f);
                 break;
@@ -892,7 +1175,21 @@ namespace ResonaPro
     {
         auto xmlState = getXmlFromBinary (data, sizeInBytes);
         if (xmlState != nullptr && xmlState->hasTagName (apvts.state.getType()))
-            apvts.replaceState (juce::ValueTree::fromXml (*xmlState));
+        {
+            auto newTree = juce::ValueTree::fromXml (*xmlState);
+            for (auto* param : getParameters()) {
+                if (auto* apvtsParam = dynamic_cast<juce::AudioProcessorParameterWithID*>(param)) {
+                    bool found = false;
+                    for (auto child : newTree) {
+                        if (child.hasType("PARAM") && child.getProperty("id").toString() == apvtsParam->paramID) {
+                            found = true; break;
+                        }
+                    }
+                    if (!found) apvtsParam->setValueNotifyingHost(apvtsParam->getDefaultValue());
+                }
+            }
+            apvts.replaceState (newTree);
+        }
     }
 }
 

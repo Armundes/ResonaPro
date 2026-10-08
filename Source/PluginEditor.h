@@ -45,6 +45,7 @@ namespace ResonaPro
                          modeHardButton { "HARD" },
                          midSideButton { "MID/SIDE" },
                          deltaButton { "DELTA" },
+                         soloCutButton { "SOLO CUT" },
                          resetBandsButton { "RESET BANDS" },
                          matchButton { "MATCH" },
                          copyBandsButton { "COPY" },
@@ -53,12 +54,20 @@ namespace ResonaPro
                          keyButton { "EXT KEY" },
                          lowBandButton { "LOW DETAIL" },
                          learnButton { "LEARN" },
-                         applyLearnButton { "APPLY" };
+                         applyLearnButton { "APPLY" },
+                         undoLearnButton { "UNDO" };
         juce::Slider motionSlider;
         juce::Label motionLabel, learnStatus;
 
-        juce::TextButton drawerButton { "FINE TUNE ◂" };
-        bool isDrawerOpen = true;
+        juce::TextButton drawerButton { "FINE TUNE ▸" };
+
+        /** The drawer holds the controls a user reaches for now and then. It is
+            closed by default so the first impression is the graph and the eight
+            controls that matter, and its state carries across editor reopen
+            because reopening a plugin should not cost the same two clicks twice.
+        */
+        static bool& drawerPreference() { static bool open = false; return open; }
+        bool isDrawerOpen = drawerPreference();
 
         juce::Slider attackTiltSlider, releaseTiltSlider, detailTiltSlider, sibilanceSlider;
         juce::Label  attackTiltLabel, releaseTiltLabel, detailTiltLabel, sibilanceLabel;
@@ -69,6 +78,16 @@ namespace ResonaPro
         uint64_t lastLearnSequence = 0;
         void timerCallback() override;
         void finishLearning();
+
+        // Phase 8: what the take's own sibilance looked like. Kept until the
+        // user presses APPLY, so nothing changes during capture.
+        SibilanceDeEsser::Profile learnedSibilance;
+
+        // The full read of the take, and the values LEARN wrote so they can be
+        // taken back. See docs/LEARN-DESIGN.md.
+        LearnAnalyzer::TakeProfile learnedProfile;
+        bool  learnApplied = false;
+        std::vector<std::pair<juce::String, float>> learnUndo;
 
         /** Runtime information the user cannot otherwise see: the true frequency
             resolution of the current transform and the latency it costs.
@@ -100,7 +119,8 @@ namespace ResonaPro
                                           stereoLinkAttachment;
 
         std::unique_ptr<ButtonAttachment> bypassAttachment, iso226Attachment, modeHardAttachment,
-                                          midSideAttachment, deltaAttachment, matchAttachment;
+                                          midSideAttachment, deltaAttachment, soloCutAttachment,
+                                          matchAttachment;
         std::unique_ptr<ButtonAttachment> keyAttachment, lowBandAttachment;
         std::unique_ptr<SliderAttachment> motionAttachment;
         std::unique_ptr<SliderAttachment> attackTiltAttachment, releaseTiltAttachment,

@@ -21,10 +21,12 @@ BUILD_DIR="${ROOT}/.work/build/ResonaPro_artefacts/Release"
 ROLLBACK_DIR="${ROOT}/.work/backups/rollbacks"
 
 VST3_SRC="${BUILD_DIR}/VST3/ResonaPro.vst3"
+VST2_SRC="${BUILD_DIR}/VST/ResonaPro.vst"
 AU_SRC="${BUILD_DIR}/AU/ResonaPro.component"
 STANDALONE_SRC="${BUILD_DIR}/Standalone/ResonaPro.app"
 
 VST3_DST="${HOME}/Library/Audio/Plug-Ins/VST3"
+VST2_DST="${HOME}/Library/Audio/Plug-Ins/VST"
 AU_DST="${HOME}/Library/Audio/Plug-Ins/Components"
 
 # The standalone build goes where a person can actually launch it. Spotlight and
@@ -44,9 +46,15 @@ fi
 
 echo "Installing ResonaPro..."
 mkdir -p "${VST3_DST}" "${AU_DST}" "${STANDALONE_DST}"
+[ -d "${VST2_SRC}" ] && mkdir -p "${VST2_DST}"
 
 entries=("${VST3_SRC}|${VST3_DST}|ResonaPro.vst3"
          "${AU_SRC}|${AU_DST}|ResonaPro.component")
+# VST2 is only present when the build was given a VST2 SDK, so treat it as
+# optional rather than expecting it.
+if [ -d "${VST2_SRC}" ]; then
+    entries+=("${VST2_SRC}|${VST2_DST}|ResonaPro.vst")
+fi
 if [ -d "${STANDALONE_SRC}" ]; then
     entries+=("${STANDALONE_SRC}|${STANDALONE_DST}|ResonaPro.app")
 else
@@ -57,7 +65,7 @@ stamp="$(date +%Y%m%d-%H%M%S)"
 for entry in "${entries[@]}"; do
     IFS='|' read -r src dst name <<< "${entry}"
     stage="${dst}/${name}.staging-${stamp}"
-    if [ "${name}" = "ResonaPro.vst3" ]; then
+    if [ "${name}" = "ResonaPro.vst3" ] || [ "${name}" = "ResonaPro.vst" ]; then
         mkdir -p "${stage}"
         # Synced Documents folders can sprout ghost "moduleinfo 2.json" files.
         # They are not VST3 metadata and can make ditto fail with EDEADLK.
@@ -92,6 +100,7 @@ done
 killall AudioComponentRegistrar >/dev/null 2>&1 || true
 
 echo "  VST3 -> ${VST3_DST}/ResonaPro.vst3"
+[ -d "${VST2_SRC}" ] && echo "  VST2 -> ${VST2_DST}/ResonaPro.vst"
 echo "  AU   -> ${AU_DST}/ResonaPro.component"
 if [ -d "${STANDALONE_SRC}" ]; then
     echo "  App  -> ${STANDALONE_DST}/ResonaPro.app"

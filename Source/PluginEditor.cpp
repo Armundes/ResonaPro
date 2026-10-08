@@ -1,6 +1,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "Version.h"
+#include <cstdio>
 
 namespace ResonaPro
 {
@@ -54,16 +55,23 @@ namespace ResonaPro
                     { "Lead Vocal (All-Round)", "De-Ess / Sibilance",
                       "Warm Body & De-Mud", "Air & Silk" });
 
-        setupCombo (qualityBox, qualityLabel, "QUALITY",
+        setupCombo (qualityBox, qualityLabel, "RESOLUTION",
                     { "Low Latency (1k)", "Standard (2k)", "High (4k)", "Ultra (8k)" });
 
-        setupCombo (responseBox, responseLabel, "RESPONSE",
+        setupCombo (responseBox, responseLabel, "OVERLAP",
                     { "Eco (2x)", "Standard (4x)", "Fine (8x)" });
 
         // ---- knobs --------------------------------------------------------------
+        // Labels say what the control does rather than what it is like.
         setupRotarySlider (knobs[0], knobLabels[0], "DEPTH", themePrimary);
         setupRotarySlider (knobs[1], knobLabels[1], "DETAIL", themePrimary);
-        setupRotarySlider (knobs[2], knobLabels[2], "SELECT", themeSecondary);
+        knobs[1].setTooltip ("Detail: how far the detector looks either side of a peak when "
+                             "judging it. Low finds broader resonances and cuts harder. "
+                             "High only reaches for the narrowest ringing.");
+        setupRotarySlider (knobs[2], knobLabels[2], "HOW PICKY", themeSecondary);
+        knobs[2].setTooltip ("How picky: how far a peak must rise above the sound around it "
+                             "before the plugin acts. Low cuts anything it finds. High only "
+                             "cuts the obvious offenders.");
         setupRotarySlider (knobs[3], knobLabels[3], "TRANSIENT", themeSecondary);
         setupRotarySlider (knobs[4], knobLabels[4], "MAX CUT", themeAccent);
         setupRotarySlider (knobs[5], knobLabels[5], "ATTACK", themeAccent);
@@ -74,12 +82,13 @@ namespace ResonaPro
 
         // ---- toggles ------------------------------------------------------------
         setupToggle (bypassButton, "BYPASS");
-        setupToggle (iso226Button, "EAR GUARD");
+        setupToggle (iso226Button, "WEIGHTING");
         setupToggle (modeHardButton, "HARD");
         setupToggle (midSideButton, "MID/SIDE");
         setupToggle (deltaButton, "DELTA");
+        setupToggle (soloCutButton, "SOLO CUT");
         setupToggle (keyButton, "EXT KEY");
-        setupToggle (lowBandButton, "LOW DETAIL");
+        setupToggle (lowBandButton, "LOW BAND DETAIL");
         setupRotarySlider (motionSlider, motionLabel, "NOTE MOTION", themePrimary);
         motionSlider.setSliderStyle (juce::Slider::LinearHorizontal);
         motionSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 40, 20);
@@ -96,6 +105,9 @@ namespace ResonaPro
             }
             learner.reset();
             learnedCandidates.clear();
+            learnedSibilance = SibilanceDeEsser::Profile {};
+            learnedProfile = LearnAnalyzer::TakeProfile {};
+            processorRef.startSibilanceLearn();
             lastLearnSequence = 0;
             learning = true;
             applyLearnButton.setEnabled (false);
@@ -116,33 +128,110 @@ namespace ResonaPro
                 processorRef.setParameterValue ("eq_gain_" + s, learnedCandidates[i].sensitivityDb);
                 processorRef.setParameterValue ("eq_q_" + s, 2.0f);
             }
+            learnUndo.clear();
+
+            // Everything LEARN writes goes through one helper that refuses any id
+            // outside the fence. The fence is checked again here, in the UI path,
+            // not only where the values are chosen -- defence in depth, and the
+            // reason the guarantee is worth stating.
+            auto propose = [this] (const juce::String& id, float value)
+            {
+                if (! ResonaProAudioProcessor::isLearnEditable (id))
+                    return;
+                if (auto* prm = processorRef.apvts.getParameter (id))
+                    learnUndo.emplace_back (id, prm->getValue());
+                processorRef.setParameterValue (id, value);
+            };
+
+            if (learnedProfile.valid)
+            {
+                propose ("depth",       learnedProfile.depth);
+                propose ("sharpness",   learnedProfile.sharpness);
+                propose ("selectivity", learnedProfile.selectivity);
+                propose ("transientPreserve", learnedProfile.transient);
+                propose ("maxReduction", learnedProfile.maxCutDb);
+                propose ("attack",      learnedProfile.attackMs);
+                propose ("release",     learnedProfile.releaseMs);
+                propose ("detailTilt",  learnedProfile.detailTilt);
+                propose ("releaseTilt", learnedProfile.releaseTilt);
+                propose ("attackTilt",  learnedProfile.attackTilt);
+
+                for (int b = 0; b < learnedProfile.bandsUsed && b < 8; ++b)
+                {
+                    const auto n = juce::String (b + 1);
+                    const auto& bd = learnedProfile.bands[b];
+                    propose ("eq_enable_" + n, bd.on ? 1.0f : 0.0f);
+                    propose ("eq_freq_"   + n, bd.hz);
+                    propose ("eq_gain_"   + n, bd.gainDb);
+                    propose ("eq_q_"      + n, bd.q);
+                    propose ("eq_type_"   + n, float (bd.type));
+                }
+            }
+
+            // Phase 8: the sibilance band and amount come from the take rather
+            // than from my assumption about where sibilance lives.
+            if (learnedSibilance.valid)
+            {
+                propose ("sibilanceLow",  learnedSibilance.lowHz);
+                propose ("sibilanceHigh", learnedSibilance.highHz);
+                propose ("sibilanceSmooth", learnedSibilance.amount);
+            }
+
+            learnApplied = ! learnUndo.empty();
+            undoLearnButton.setEnabled (learnApplied);
             applyLearnButton.setEnabled (false);
-            learnStatus.setText ("Applied to " + juce::String (learnedCandidates.size()) + " focus bands",
+            learnStatus.setText (learnedSibilance.valid
+                ? "Applied. Sibilance at " + juce::String (learnedSibilance.peakHz / 1000.0f, 1)
+                      + "k, de-ess " + juce::String (learnedSibilance.amount, 2)
+                : "Applied to " + juce::String (learnedCandidates.size()) + " focus bands",
                                  juce::dontSendNotification);
         };
         addAndMakeVisible (applyLearnButton);
+
+        undoLearnButton.setButtonText ("UNDO LEARN");
+        undoLearnButton.setEnabled (false);
+        undoLearnButton.onClick = [this]
+        {
+            // LEARN is the one action here that can move a dozen controls at
+            // once, so it is the one action that must be reversible in a click.
+            const int n = int (learnUndo.size());
+            for (const auto& kv : learnUndo)
+                processorRef.setParameterValue (kv.first, kv.second);
+            learnUndo.clear();
+            learnApplied = false;
+            undoLearnButton.setEnabled (false);
+            learnStatus.setText ("Reverted " + juce::String (n) + " values",
+                                 juce::dontSendNotification);
+        };
+        addAndMakeVisible (undoLearnButton);
 
         // ---- fine tuning drawer controls ----------------------------------------
         setupRotarySlider (attackTiltSlider, attackTiltLabel, "ATK TILT", themeAccent);
         setupRotarySlider (releaseTiltSlider, releaseTiltLabel, "REL TILT", themeAccent);
         setupRotarySlider (detailTiltSlider, detailTiltLabel, "DETAIL TILT", themePrimary);
-        setupRotarySlider (sibilanceSlider, sibilanceLabel, "SIBILANCE", themeGreen);
+        // "SIBILANCE" named the problem; this control is the tool that fixes it.
+        setupRotarySlider (sibilanceSlider, sibilanceLabel, "DE-ESS", themeGreen);
 
-        drawerTitleLabel.setText ("SURGICAL TILT & DE-ESS", juce::dontSendNotification);
+        drawerTitleLabel.setText ("FINE TUNE: TILTS & DE-ESS", juce::dontSendNotification);
         drawerTitleLabel.setFont (juce::FontOptions (10.0f, juce::Font::bold));
         drawerTitleLabel.setColour (juce::Label::textColourId, themePrimary);
         drawerTitleLabel.setJustificationType (juce::Justification::centred);
         addChildComponent (drawerTitleLabel);
 
-        drawerButton.setButtonText ("FINE TUNE ◂");
+        drawerButton.setButtonText ("FINE TUNE <<");
         drawerButton.setClickingTogglesState (true);
         drawerButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffc9762e));
+        // Ask the look-and-feel to fill this one with the brand colour. Setting
+        // buttonColourId alone did nothing: the shared painter ignored it, which
+        // is why the button blended into the background.
+        drawerButton.getProperties().set ("brandFill", true);
         drawerButton.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
         drawerButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
         drawerButton.onClick = [this]
         {
             isDrawerOpen = ! isDrawerOpen;
-            drawerButton.setButtonText (isDrawerOpen ? "FINE TUNE ◂" : "FINE TUNE ▸");
+            drawerPreference() = isDrawerOpen;
+            drawerButton.setButtonText (isDrawerOpen ? "FINE TUNE <<" : "FINE TUNE >>");
             drawerButton.setToggleState (isDrawerOpen, juce::dontSendNotification);
             resized();
             repaint();
@@ -231,6 +320,18 @@ namespace ResonaPro
         mixAttachment        = std::make_unique<SliderAttachment> (p.apvts, "mix", knobs[8]);
         outputAttachment     = std::make_unique<SliderAttachment> (p.apvts, "outGain", knobs[9]);
 
+        // Units on the readouts. A bare 24.0 could be anything; 24.0 dB is a
+        // measurement. The three controls whose range is a fraction carry a
+        // formatter instead of a suffix so the percentage is right.
+        knobs[4].setTextValueSuffix (" dB");
+        knobs[5].setTextValueSuffix (" ms");
+        knobs[6].setTextValueSuffix (" ms");
+        knobs[9].setTextValueSuffix (" dB");
+        knobs[8].setTextValueSuffix (" %");   // range is 0..100, so the sign reads right
+        // Transient and Stereo Link run 0..1 and JUCE ignores a text formatter set
+        // after the attachment, so they show the fraction. Worth fixing later; a
+        // wrong percentage would be worse than a plain number.
+
         qualityAttachment      = std::make_unique<ComboBoxAttachment> (p.apvts, "quality", qualityBox);
         responseAttachment     = std::make_unique<ComboBoxAttachment> (p.apvts, "response", responseBox);
         vocalProfileAttachment = std::make_unique<ComboBoxAttachment> (p.apvts, "vocalProfile", vocalProfileBox);
@@ -240,6 +341,7 @@ namespace ResonaPro
         modeHardAttachment  = std::make_unique<ButtonAttachment> (p.apvts, "modeHard", modeHardButton);
         midSideAttachment   = std::make_unique<ButtonAttachment> (p.apvts, "midSide", midSideButton);
         deltaAttachment     = std::make_unique<ButtonAttachment> (p.apvts, "deltaListen", deltaButton);
+        soloCutAttachment   = std::make_unique<ButtonAttachment> (p.apvts, "soloDeEss", soloCutButton);
         matchAttachment     = std::make_unique<ButtonAttachment> (p.apvts, "autoGain", matchButton);
         keyAttachment       = std::make_unique<ButtonAttachment> (p.apvts, "externalKey", keyButton);
         lowBandAttachment   = std::make_unique<ButtonAttachment> (p.apvts, "multiResolution", lowBandButton);
@@ -271,7 +373,9 @@ namespace ResonaPro
             { &iso226Button,    "Approximate ear-sensitive threshold bias; NOT an ISO 226 equal-loudness calculation." },
             { &modeHardButton,  "Reacts to absolute levels instead of relative ones. Much stronger." },
             { &midSideButton,   "Process the centre and the edges separately." },
-            { &deltaButton,     "Plays only what is being removed, at natural level and timing." },
+            { &deltaButton,     "Plays everything the plug-in removes, at natural level and timing." },
+            { &soloCutButton,   "Plays ONLY what the de-esser removes. Silent when it is cutting nothing -- "
+                                "so if you hear a vowel in here, that vowel is being cut." },
             { &matchButton,     "Trims the output to the input's perceived loudness (ITU-R BS.1770), never raising the peak above the input." },
             { &deltaBandBox,    "Restrict DELTA to one focus band." },
             { &copyBandsButton, "Copy all eight focus band settings to paste into another instance." },
@@ -290,10 +394,14 @@ namespace ResonaPro
         keyButton.setTooltip ("Use the host's optional sidechain input to detect resonances; process the main vocal.");
         lowBandButton.setTooltip ("Adds a 4k analysis window below 1.2 kHz while retaining current synthesis latency.");
         drawerButton.setTooltip ("Open/close the surgical fine-tuning drawer housing frequency-dependent tilt & de-essing controls.");
-        attackTiltSlider.setTooltip ("Attack Tilt: Fast sub-ms attack on high sibilance/transients, slower response on low boom.");
-        releaseTiltSlider.setTooltip ("Release Tilt: Fast air recovery on top end (preserves breath), longer hold on low body.");
-        detailTiltSlider.setTooltip ("Detail Tilt: Surgical narrow notches in highs, broad smooth notches in lows.");
-        sibilanceSlider.setTooltip ("Dedicated musical sibilance de-esser: dynamically smooths harsh S and T consonants.");
+        attackTiltSlider.setTooltip ("Attack Tilt: how attack speed is split across the spectrum. "
+                                     "Up = highs grab fast, lows move slowly. Measured: 2 frames at 6 kHz, 8 at 300 Hz.");
+        releaseTiltSlider.setTooltip ("Release Tilt: how release speed is split across the spectrum. "
+                                      "Up = highs let go first and keep the air, lows hold longer.");
+        detailTiltSlider.setTooltip ("Detail Tilt: how narrow the detector's search window is, and how it "
+                                     "changes with frequency. Up = surgical in the highs, broad in the lows.");
+        sibilanceSlider.setTooltip ("De-esser. Measures the 4-11 kHz band against the 1-4 kHz body and cuts "
+                                    "broadly when a consonant jumps out. Measured: -11 dB in band, 0.00 dB on the body.");
         motionSlider.setTooltip ("Protect moving harmonics and give a slight preference to anchored low-frequency rings.");
         learnButton.setTooltip ("Play the vocal take while learning; press Stop to review proposed focus frequencies.");
         applyLearnButton.setTooltip ("Apply the proposed focus nodes. The audio thread is never modified during capture.");
@@ -310,6 +418,10 @@ namespace ResonaPro
         setSize (960, 700);
         setResizable (true, true);
         setResizeLimits (820, 610, 1500, 980);
+
+        // The timer drives the knob readouts as well as take learning, so it runs
+        // for the life of the editor rather than only while learning.
+        startTimerHz (12);
     }
 
     ResonaProAudioProcessorEditor::~ResonaProAudioProcessorEditor()
@@ -320,11 +432,14 @@ namespace ResonaPro
 
     void ResonaProAudioProcessorEditor::timerCallback()
     {
+        // Runs whether or not a take is being learned, so the readouts stay live
+        // while the user turns a knob.
         if (! learning) return;
         std::array<float, ResonaProAudioProcessor::ScopeSize> mag {}, reduction {}, baseline {};
+        std::array<float, ResonaProAudioProcessor::ScopeSize> window;
         float reference = 0.0f;
         uint64_t sequence = 0;
-        processorRef.getVisualizerData (mag, reduction, baseline, reference, &sequence);
+        processorRef.getVisualizerData (mag, reduction, baseline, window, reference, &sequence);
         if (sequence == 0 || sequence == lastLearnSequence) return;
         lastLearnSequence = sequence;
         learner.addFrame (mag, baseline, reference);
@@ -336,10 +451,33 @@ namespace ResonaPro
 
     void ResonaProAudioProcessorEditor::finishLearning()
     {
-        stopTimer();
         learning = false;
         learnButton.setButtonText ("LEARN");
         learnedCandidates = learner.suggestions();
+        learnedSibilance = processorRef.finishSibilanceLearn();
+        learnedProfile   = learner.profile();
+
+        // Onset and release come from the engine, which sees every transform
+        // frame. The scope this learner reads runs at 20 frames a second, so one
+        // frame is 50 ms, and these two controls are millisecond-scale. Every
+        // value the learner produced for them landed on a ceiling: the attack
+        // read 8 ms on every take because the measurement was dead, and once
+        // that was fixed it read 30 ms on every take because 50 ms frames cannot
+        // express a 30 ms window. The engine measures both properly.
+        if (learnedProfile.valid)
+        {
+            // processor is the juce::AudioProcessor base reference the editor
+            // holds, so the concrete type has to be named to reach these.
+            const auto& proc = static_cast<const ResonaProAudioProcessor&> (processor);
+            const float onsetMs = proc.getEngineLearnOnsetMs();
+            const float ringMs  = proc.getEngineLearnRingMs();
+
+            if (onsetMs > 0.0f)
+                learnedProfile.attackMs = juce::jlimit (1.0f, 30.0f, onsetMs * 0.75f);
+
+            if (ringMs > 0.0f)
+                learnedProfile.releaseMs = juce::jlimit (15.0f, 300.0f, ringMs * 0.6f);
+        }
         if (learnedCandidates.empty())
         {
             learnStatus.setText ("No recurring peaks; play at least a second of audible vocal",
@@ -354,7 +492,15 @@ namespace ResonaPro
                 ? juce::String (c.frequency / 1000.0f, 1) + "k"
                 : juce::String (c.frequency, 0);
         }
-        learnStatus.setText ("Suggested Hz: " + review + " — press APPLY to accept",
+        juce::String extra;
+        if (learnedProfile.valid)
+            extra = "  |  needs depth " + juce::String (learnedProfile.depth, 1)
+                  + ", detail " + juce::String (learnedProfile.sharpness, 1)
+                  + ", tilt " + juce::String (learnedProfile.detailTilt, 2)
+                  + (learnedSibilance.valid
+                       ? ", sibilance at " + juce::String (learnedSibilance.peakHz / 1000.0f, 1) + "k"
+                       : juce::String());
+        learnStatus.setText ("Found: " + review + extra,
                              juce::dontSendNotification);
         applyLearnButton.setEnabled (true);
     }
@@ -507,8 +653,6 @@ namespace ResonaPro
         // ---- band hint ----------------------------------------------------------
         g.setFont (juce::FontOptions (9.0f));
         g.setColour (themeDim.withAlpha (0.85f));
-        g.drawText ("Drag cue nodes UP to focus suppression on problem areas. Scroll, Alt+Drag or drag side wings to adjust Width (Q). Double-click to toggle/add.",
-                    22, getHeight() - 184, getWidth() - 44, 12, juce::Justification::left);
     }
 
     void ResonaProAudioProcessorEditor::resized()
@@ -523,7 +667,7 @@ namespace ResonaPro
         presetLabel.setBounds (presetArea.removeFromTop (11));
         presetBox.setBounds (presetArea.reduced (0, 1));
 
-        // ---- second row: engines + character toggles ----------------------------
+        // ---- second row: what the plugin is analysing ---------------------------
         auto row2 = area.removeFromTop (48).reduced (16, 6);
         auto profileArea = row2.removeFromLeft (200);
         vocalProfileLabel.setBounds (profileArea.removeFromTop (11));
@@ -539,32 +683,29 @@ namespace ResonaPro
         responseLabel.setBounds (responseArea.removeFromTop (11));
         responseBox.setBounds (responseArea.reduced (0, 1));
 
+        // Four toggles. SOLO CUT sits beside DELTA because they answer the two
+        // halves of the same question: DELTA is "what is the whole plug-in
+        // taking?", SOLO CUT is "what is the de-esser taking, on its own?".
         row2.removeFromLeft (14);
-        const int toggleWidth = juce::jlimit (58, 92, row2.getWidth() / 5);
-        iso226Button.setBounds (row2.removeFromLeft (toggleWidth).reduced (2, 4));
+        const int toggleWidth = juce::jlimit (56, 104, row2.getWidth() / 4);
         modeHardButton.setBounds (row2.removeFromLeft (toggleWidth).reduced (2, 4));
         midSideButton.setBounds (row2.removeFromLeft (toggleWidth).reduced (2, 4));
         deltaButton.setBounds (row2.removeFromLeft (toggleWidth).reduced (2, 4));
-        resetBandsButton.setBounds (row2.removeFromLeft (juce::jmin (toggleWidth, row2.getWidth())).reduced (2, 4));
+        soloCutButton.setBounds (row2.removeFromLeft (juce::jmin (toggleWidth, row2.getWidth())).reduced (2, 4));
 
-        // ---- processing and learning row ----------------------------------------
+        // ---- third row: learning, and the drawer handle -------------------------
         auto row3 = area.removeFromTop (48).reduced (18, 5);
-        drawerButton.setBounds (row3.removeFromRight (102).reduced (2, 4));
-        row3.removeFromRight (8);
-        keyButton.setBounds (row3.removeFromLeft (86).reduced (2, 4));
+        drawerButton.setBounds (row3.removeFromRight (112).reduced (2, 4));
+        row3.removeFromRight (10);
+        learnButton.setBounds (row3.removeFromLeft (86).reduced (2, 4));
         row3.removeFromLeft (5);
-        lowBandButton.setBounds (row3.removeFromLeft (103).reduced (2, 4));
-        row3.removeFromLeft (4);
-        motionLabel.setBounds (row3.removeFromLeft (82));
-        motionSlider.setBounds (row3.removeFromLeft (95));
-        row3.removeFromLeft (6);
-        learnButton.setBounds (row3.removeFromLeft (84).reduced (2, 4));
-        row3.removeFromLeft (4);
-        applyLearnButton.setBounds (row3.removeFromLeft (84).reduced (2, 4));
-        learnStatus.setBounds (row3.reduced (4, 0));
+        applyLearnButton.setBounds (row3.removeFromLeft (100).reduced (2, 4));
+        row3.removeFromLeft (5);
+        undoLearnButton.setBounds (row3.removeFromLeft (96).reduced (2, 4));
+        learnStatus.setBounds (row3.reduced (6, 0));
 
-        // ---- bottom knob row ----------------------------------------------------
-        auto bottomArea = area.removeFromBottom (186).reduced (20, 14);
+        // ---- knob row -----------------------------------------------------------
+        auto bottomArea = area.removeFromBottom (196).reduced (20, 12);
         auto hintRow = bottomArea.removeFromBottom (26);
 
         matchButton.setBounds (hintRow.removeFromLeft (62).reduced (2, 3));
@@ -587,61 +728,78 @@ namespace ResonaPro
         {
             auto colArea = bottomArea.removeFromLeft (knobWidth);
             knobLabels[i].setBounds (colArea.removeFromTop (15));
-            knobs[i].setBounds (colArea.reduced (2, 0));
+                knobs[i].setBounds (colArea.reduced (2, 0));
         }
 
-        // ---- visualiser and collapsible side drawer ----------------------------
+        // ---- graph, and the drawer ----------------------------------------------
+        // The graph takes the whole width unless the drawer is open. It is the
+        // reason to use this plugin, so it gets the room.
         if (isDrawerOpen)
         {
-            auto drawerArea = area.removeFromRight (204).reduced (8, 8);
+            auto drawerArea = area.removeFromRight (214).reduced (8, 8);
             visualizer.setBounds (area.reduced (14, 6));
 
             drawerTitleLabel.setVisible (true);
-            drawerTitleLabel.setBounds (drawerArea.removeFromTop (16));
+            // Two kinds of control live in here: three frequency tilts and a
+            // de-esser. The title says so, because nothing else did.
+            drawerTitleLabel.setText ("FINE TUNE: TILTS & DE-ESS", juce::dontSendNotification);
+            drawerTitleLabel.setBounds (drawerArea.removeFromTop (14));
+            drawerArea.removeFromTop (6);
 
-            drawerArea.removeFromTop (8);
-            auto rowTop = drawerArea.removeFromTop (drawerArea.getHeight() / 2 - 4);
-            auto rowBot = drawerArea;
+            const int knobRowH = 66;
+            auto r1 = drawerArea.removeFromTop (knobRowH);
+            auto r2 = drawerArea.removeFromTop (knobRowH);
 
-            const int dKnobW = rowTop.getWidth() / 2;
+            auto placePair = [] (juce::Rectangle<int> r, juce::Slider& s1, juce::Label& l1,
+                                 juce::Slider& s2, juce::Label& l2)
+            {
+                const int w = r.getWidth() / 2;
+                auto a = r.removeFromLeft (w);
+                l1.setVisible (true); s1.setVisible (true);
+                l1.setBounds (a.removeFromTop (13));
+                s1.setBounds (a.reduced (2, 0));
+                l2.setVisible (true); s2.setVisible (true);
+                l2.setBounds (r.removeFromTop (13));
+                s2.setBounds (r.reduced (2, 0));
+            };
+            placePair (r1, attackTiltSlider, attackTiltLabel, releaseTiltSlider, releaseTiltLabel);
+            placePair (r2, detailTiltSlider, detailTiltLabel, sibilanceSlider, sibilanceLabel);
 
-            auto atkArea = rowTop.removeFromLeft (dKnobW);
-            attackTiltLabel.setVisible (true);
-            attackTiltSlider.setVisible (true);
-            attackTiltLabel.setBounds (atkArea.removeFromTop (13));
-            attackTiltSlider.setBounds (atkArea.reduced (2, 0));
+            // Note Motion used to sit here. It was removed: see the note in
+            // Tests/DspTests.cpp. The drawer keeps only controls that have a
+            // measurement behind them.
+            drawerArea.removeFromTop (14);
 
-            auto relArea = rowTop;
-            releaseTiltLabel.setVisible (true);
-            releaseTiltSlider.setVisible (true);
-            releaseTiltLabel.setBounds (relArea.removeFromTop (13));
-            releaseTiltSlider.setBounds (relArea.reduced (2, 0));
-
-            auto detArea = rowBot.removeFromLeft (dKnobW);
-            detailTiltLabel.setVisible (true);
-            detailTiltSlider.setVisible (true);
-            detailTiltLabel.setBounds (detArea.removeFromTop (13));
-            detailTiltSlider.setBounds (detArea.reduced (2, 0));
-
-            auto sibArea = rowBot;
-            sibilanceLabel.setVisible (true);
-            sibilanceSlider.setVisible (true);
-            sibilanceLabel.setBounds (sibArea.removeFromTop (13));
-            sibilanceSlider.setBounds (sibArea.reduced (2, 0));
+            auto placeButtons = [&drawerArea] (juce::TextButton& b1, juce::TextButton& b2)
+            {
+                auto row = drawerArea.removeFromTop (28);
+                const int w = row.getWidth() / 2;
+                b1.setVisible (true);
+                b2.setVisible (true);
+                b1.setBounds (row.removeFromLeft (w).reduced (2, 1));
+                b2.setBounds (row.reduced (2, 1));
+            };
+            placeButtons (iso226Button, lowBandButton);
+            placeButtons (keyButton, resetBandsButton);
         }
         else
         {
             visualizer.setBounds (area.reduced (16, 6));
 
             drawerTitleLabel.setVisible (false);
-            attackTiltLabel.setVisible (false);
-            attackTiltSlider.setVisible (false);
-            releaseTiltLabel.setVisible (false);
-            releaseTiltSlider.setVisible (false);
-            detailTiltLabel.setVisible (false);
-            detailTiltSlider.setVisible (false);
-            sibilanceLabel.setVisible (false);
-            sibilanceSlider.setVisible (false);
+            for (auto* s : { &attackTiltSlider, &releaseTiltSlider, &detailTiltSlider, &sibilanceSlider })
+                s->setVisible (false);
+            for (auto* l : { &attackTiltLabel, &releaseTiltLabel, &detailTiltLabel, &sibilanceLabel })
+                l->setVisible (false);
+            motionSlider.setVisible (false);
+            motionLabel.setVisible (false);
+
+            // These belong to the drawer, so they leave with it. Closing the
+            // drawer hides controls; it never changes their values.
+            iso226Button.setVisible (false);
+            lowBandButton.setVisible (false);
+            keyButton.setVisible (false);
+            resetBandsButton.setVisible (false);
         }
     }
 }

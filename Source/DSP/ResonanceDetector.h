@@ -35,7 +35,6 @@ namespace ResonaPro
         float sharpness         = 1.0f;  // 0.2 .. 4.0
         float detailTilt        = 0.0f;  // -1.0 .. +1.0 (positive = surgical highs, broad lows)
         float selectivity       = 0.5f;  // 0.0 .. 1.0
-        float sibilanceSmooth   = 0.5f;  // 0.0 .. 1.0 (dedicated musical S/T consonant smoother)
         float transientGuard    = 0.5f;  // 0.0 .. 1.0
         float transientActivity = 0.0f;  // 0.0 .. 1.0
         float depth             = 1.0f;  // Drives sensitivity & suppression depth
@@ -49,7 +48,7 @@ namespace ResonaPro
     public:
         ResonanceDetector() = default;
 
-        void prepare (int numBins, float sampleRate)
+        void prepare (int numBins, float sampleRate, int hopSamples)
         {
             bins     = std::max (2, numBins);
             sr       = sampleRate > 0.0f ? sampleRate : 44100.0f;
@@ -59,11 +58,28 @@ namespace ResonaPro
             profileOffsetDb.resize (static_cast<size_t> (bins));
             iso226Db.resize (static_cast<size_t> (bins));
             radialBins.resize (static_cast<size_t> (bins));
+            periodHistory.fill (0.0f);
+            periodHistoryIdx   = 0;
+            periodHistoryCount = 0;
+            periodThen         = 0.0f;
             prefix.resize (static_cast<size_t> (bins) + 1, 0.0);
             prominenceDb.resize (static_cast<size_t> (bins), 0.0f);
             baselineDb.resize (static_cast<size_t> (bins), -120.0f);
             magDb.resize (static_cast<size_t> (bins), -120.0f);
             previousMagDb.assign (static_cast<size_t> (bins), -240.0f);
+            
+            float frameMs = 1000.0f * (hopSamples > 0 ? hopSamples : 512) / sr;
+            temporalFrames = std::clamp(static_cast<int>(200.0f / std::max(1.0f, frameMs)), 1, 64);
+            prominenceHistory.assign(static_cast<size_t>(bins * temporalFrames), 0.0f);
+            historyWriteIdx = 0;
+            temporalScratch.reserve(static_cast<size_t>(temporalFrames));
+            
+            magHistory.assign(static_cast<size_t>(bins * hpsFrames), 0.0f);
+            magWriteIdx = 0;
+            hpsScratch.reserve(static_cast<size_t>(hpsFrames));
+            vScratch.reserve(32);
+            percussiveFlags.assign(static_cast<size_t>(bins), false);
+
             resetHistory();
             activeBins.reserve (static_cast<size_t> (bins));
             magSmooth.assign (static_cast<size_t> (bins), 0.0f);
@@ -80,10 +96,6 @@ namespace ResonaPro
 
         void setVocalProfile (VocalProfile profile) { updateProfileWeights (profile); }
 
-        void setFullScaleReference (float fullScale) noexcept
-        {
-            fullScaleReference = fullScale > 0.0f ? fullScale : 1.0f;
-        }
 
         void resetHistory() noexcept
         {
@@ -92,6 +104,10 @@ namespace ResonaPro
             historyValid = false;
             std::fill (previousMagDb.begin(), previousMagDb.end(), -240.0f);
             lastReferencePromDb = 0.0f;
+            std::fill (prominenceHistory.begin(), prominenceHistory.end(), 0.0f);
+            historyWriteIdx = 0;
+            std::fill(magHistory.begin(), magHistory.end(), 0.0f);
+            magWriteIdx = 0;
         }
 
         float binFrequency (int bin) const noexcept
@@ -107,11 +123,46 @@ namespace ResonaPro
             @param p          Detection parameters.
         */
         void detect (const float* magnitude,
+                     const float* trueEnvelope,
                      const float* weightsDb,
                      float* out,
                      const DetectorParams& p)
         {
             if (magnitude == nullptr || out == nullptr || bins <= 0) return;
+
+            // ---- 0. Harmonic-Percussive Separation (HPS) --------------------------
+            int magOffset = magWriteIdx * bins;
+            for (int k = 0; k < bins; ++k)
+                magHistory[static_cast<size_t>(magOffset + k)] = magnitude[k];
+            magWriteIdx = (magWriteIdx + 1) % hpsFrames;
+
+            if (p.transientGuard > 0.01f)
+            {
+                const int vRadius = std::max(3, bins / 64);
+                const float guardThreshold = 1.0f + (1.0f - std::clamp(p.transientGuard, 0.0f, 1.0f));
+                for (int k = 0; k < bins; ++k)
+                {
+                    hpsScratch.clear();
+                    for (int t = 0; t < hpsFrames; ++t)
+                        hpsScratch.push_back(magHistory[static_cast<size_t>(t * bins + k)]);
+                    std::nth_element(hpsScratch.begin(), hpsScratch.begin() + hpsFrames / 2, hpsScratch.end());
+                    float hMed = hpsScratch[hpsFrames / 2];
+
+                    vScratch.clear();
+                    int startBin = std::max(0, k - vRadius);
+                    int endBin = std::min(bins - 1, k + vRadius);
+                    for (int j = startBin; j <= endBin; ++j)
+                        vScratch.push_back(magnitude[j]);
+                    std::nth_element(vScratch.begin(), vScratch.begin() + vScratch.size() / 2, vScratch.end());
+                    float vMed = vScratch[vScratch.size() / 2];
+
+                    percussiveFlags[static_cast<size_t>(k)] = (vMed > hMed * guardThreshold);
+                }
+            }
+            else
+            {
+                std::fill(percussiveFlags.begin(), percussiveFlags.end(), false);
+            }
 
             // ---- 1. Magnitude prefix sums and peak envelope -----------------------
             double framePeak = 0.0;
@@ -128,6 +179,20 @@ namespace ResonaPro
             const float refMag = static_cast<float> (framePeak);
             const float detailTilt = std::clamp (p.detailTilt, -1.0f, 1.0f);
 
+            // The DETAIL dial now runs 0 .. 10. It used to be a raw multiplier
+            // whose effect stopped at 1.0, which left three quarters of the
+            // travel doing nothing. The dial is spread geometrically instead, so
+            // every position changes the analysis window: 0 is the widest window
+            // the detector uses, 10 the narrowest.
+            const float dialT = std::clamp (p.sharpness / 10.0f, 0.0f, 1.0f);
+            const float dialSharpness = 0.20f * std::pow (20.0f, dialT);
+
+            // The window is also allowed to keep narrowing toward the top of the
+            // dial, but only down to half the old floor. The floor exists so the
+            // span always reaches past the feature being measured; below that the
+            // window would read a peak's own flanks as the baseline.
+            const float floorScale = 1.0f - 0.5f * dialT;
+
             prefix[0] = 0.0;
             for (int k = 0; k < bins; ++k)
             {
@@ -142,7 +207,14 @@ namespace ResonaPro
             const float activityGate = static_cast<float> (framePeak) * 1.0e-3f;  // -60 dB
             const float audibleGate  = static_cast<float> (framePeak) * 1.5e-3f;  // -56 dB
 
-            // Fast local magnitude smoothing (radius 2 bins):
+            // Local magnitude smoothing, with the radius tracking the transform
+            // length so behaviour does not change with the resolution setting.
+            //
+            // Measured: a wider kernel looks like the obvious way to average out
+            // noise, but it averages out formant structure just as readily. At
+            // radius 6 the voice was cut only 0.61 times as hard as white noise;
+            // at radius 2 it is cut 1.64 times as hard. Broadband rejection
+            // belongs in the threshold, not in the kernel.
             const int fftLength  = 2 * (bins - 1);
             const int smoothRadius = std::clamp (
                 static_cast<int> (std::lround (2.0 * static_cast<double> (fftLength) / 2048.0)),
@@ -227,13 +299,26 @@ namespace ResonaPro
                 const float f = binFreq[static_cast<size_t> (k)];
                 const float ratio = std::clamp (std::max (20.0f, f) / 1000.0f, 0.02f, 20.0f);
                 const float tiltMul = std::pow (ratio, 0.50f * detailTilt);
-                const float effSharpness = std::clamp (p.sharpness * tiltMul, 0.20f, 5.0f);
+                const float effSharpness = std::clamp (dialSharpness * tiltMul, 0.20f, 5.0f);
 
                 // Glasberg & Moore ERB bandwidth:
                 const float erbHz = (24.7f * (4.37f * (f * 0.001f) + 1.0f)) * (1.0f / effSharpness);
                 const int erbBins = std::clamp (static_cast<int> (erbHz / binWidth), 3, maxRadius);
 
-                radialBins[static_cast<size_t> (k)] = std::clamp (std::max (erbBins, minRadiusBins), 3, maxRadius);
+                // The span has to reach past the feature it is measuring. A window
+                // narrower than the bump reads the bump's own flanks as the
+                // baseline, which hides wide resonances while leaving single-bin
+                // noise spikes standing. An ERB alone is too narrow below 1 kHz.
+                //
+                // The floor also moves with the tilt. It used to be fixed, and
+                // because it is applied as a maximum it overrode the tilted ERB
+                // and left Detail Tilt with no effect at all -- the control was
+                // wired end to end and could not change a single bin.
+                const float floorMul = 1.0f / std::max (0.25f, tiltMul);
+                const int wideFloor = std::max (4, static_cast<int> ((bins / 48)
+                                                                     * floorScale * floorMul));
+                radialBins[static_cast<size_t> (k)] = std::clamp (
+                    std::max (std::max (erbBins, minRadiusBins), wideFloor), 3, maxRadius);
             }
 
             // ---- 4. Prominence per bin -------------------------------------------
@@ -250,8 +335,8 @@ namespace ResonaPro
                 const int rTo   = k + rad;
 
                 shoulderScratch.clear();
-                appendSamples (shoulderScratch, std::max (0, lFrom), std::min (bins - 1, lTo));
-                appendSamples (shoulderScratch, rFrom, std::min (bins - 1, rTo));
+                appendSamples (shoulderScratch, magSmooth, lFrom, lTo);
+                appendSamples (shoulderScratch, magSmooth, rFrom, rTo);
 
                 float base;
                 if (shoulderScratch.size() >= 3)
@@ -275,10 +360,21 @@ namespace ResonaPro
                 }
                 if (base <= 0.0f) base = magnitude[k];
 
+                if (trueEnvelope != nullptr)
+                {
+                    base = std::max(base, trueEnvelope[k] * 0.95f);
+                }
+
                 baselineDb[static_cast<size_t> (k)] =
                     base > 1.0e-12 ? static_cast<float> (20.0 * std::log10 (base)) : -240.0f;
 
-                const float mag = magnitude[k];
+                // Compare like with like. The baseline is a percentile of the
+                // smoothed shoulders, so the numerator has to be the smoothed
+                // magnitude too. Taking the raw magnitude here pitted a single
+                // noisy bin against a smoothed floor, which reports more
+                // prominence on white noise than on a real resonance and is why
+                // the detector muffled breath and fricatives.
+                const float mag = magSmooth[static_cast<size_t> (k)];
                 float prom;
                 if (mag <= 1.0e-12f || base <= 1.0e-12)
                     prom = 0.0f;
@@ -286,8 +382,30 @@ namespace ResonaPro
                     prom = std::clamp (static_cast<float> (20.0 * std::log10 (mag / base)), -60.0f, 60.0f);
 
                 prominenceDb[static_cast<size_t> (k)] = prom;
-                maxProm = std::max (maxProm, prom);
             }
+
+            int writeOffset = historyWriteIdx * bins;
+            for (int k = 0; k < bins; ++k)
+            {
+                prominenceHistory[static_cast<size_t>(writeOffset + k)] = prominenceDb[static_cast<size_t>(k)];
+            }
+            historyWriteIdx = (historyWriteIdx + 1) % temporalFrames;
+
+            // Apply Rolling Median to prominence
+            for (int k = 0; k < bins; ++k)
+            {
+                temporalScratch.clear();
+                for (int t = 0; t < temporalFrames; ++t)
+                {
+                    temporalScratch.push_back(prominenceHistory[static_cast<size_t>(t * bins + k)]);
+                }
+                const size_t mid = temporalScratch.size() / 2;
+                std::nth_element(temporalScratch.begin(), temporalScratch.begin() + static_cast<long>(mid), temporalScratch.end());
+                float medianProm = temporalScratch[mid];
+                prominenceDb[static_cast<size_t>(k)] = medianProm;
+                maxProm = std::max(maxProm, medianProm);
+            }
+
 
             // ---- 5. Peak Scratch & Reference Monitoring --------------------------
             peakScratch.clear();
@@ -307,7 +425,7 @@ namespace ResonaPro
                 referenceProm = std::clamp (peakScratch[mid], 0.5f, 20.0f);
             }
 
-            // ---- 6. Cue-Gated, Cue-Proportional Dynamic Resonance Processing -----
+            // ---- 6. Per-bin threshold and cue emphasis ---------------------------
             const float hardOffsetDb = p.hardMode ? (2.0f - 1.5f * std::clamp (p.depth, 0.0f, 4.0f)) : 0.0f;
 
             for (int k = 0; k < bins; ++k)
@@ -320,52 +438,45 @@ namespace ResonaPro
                 }
 
                 const float fHz = binFreq[static_cast<size_t> (k)];
-                const float rawCueWeight = (weightsDb != nullptr) ? weightsDb[static_cast<size_t> (k)] : 0.0f;
-                const bool isSibilanceBand = (fHz >= 4000.0f && fHz <= 12000.0f);
-                
-                // The dedicated Sibilance smoother creates its own "virtual cue" in the high end.
-                // This ensures sibilance reduction works even if standard EQ cues are flat.
-                float effectiveCue = std::max(0.0f, rawCueWeight);
-                if (isSibilanceBand && p.sibilanceSmooth > 0.01f)
-                {
-                    effectiveCue = std::max(effectiveCue, p.sibilanceSmooth * 6.0f); // Up to +6dB equivalent cue
-                }
+                const bool hasCueWeighting = (weightsDb != nullptr);
+                const float rawCueWeight = hasCueWeighting ? weightsDb[static_cast<size_t> (k)] : 0.0f;
 
-                // RULE 1: STRICT CUE GATING
-                // If the user has not moved a cue up (and no sibilance smoothing is active),
-                // resonance reduction is EXACTLY zero.
-                if (effectiveCue <= 0.05f)
-                {
-                    out[k] = 0.0f;
-                    continue;
-                }
+                // Focus bands bias the detector. They do not gate it.
+                //
+                // A neutral band (0 dB) means "look here as normal", which is what
+                // a user expects from a plugin with no focus set. This used to be a
+                // hard gate: a band at or below +0.05 dB produced exactly zero
+                // reduction, so the plugin was transparent on its default settings
+                // and only acted where a focus band had been raised. Neutral now
+                // gives the baseline, a raised band lowers the threshold and
+                // deepens the cut, and a cut band raises the threshold and eases
+                // it. Cutting a band to exclude it still works; it is now the
+                // user's explicit choice rather than the default.
+                float effectiveCue = rawCueWeight;
 
-                // Frequency-localized nominal threshold:
                 float nominalThresholdDb;
                 if (fHz < 1000.0f)
                     nominalThresholdDb = 5.0f + p.selectivity * 3.5f;
                 else if (fHz < 3000.0f)
-                    nominalThresholdDb = 3.0f + p.selectivity * 2.5f;
+                    nominalThresholdDb = 4.5f + p.selectivity * 3.0f;
                 else if (fHz < 10000.0f)
-                    nominalThresholdDb = 1.2f + p.selectivity * 1.5f;
+                    nominalThresholdDb = 4.0f + p.selectivity * 2.5f;
                 else
-                    nominalThresholdDb = 0.8f + p.selectivity * 1.0f;
+                    nominalThresholdDb = 4.0f + p.selectivity * 2.0f;
 
                 float thr = nominalThresholdDb + hardOffsetDb;
                 thr += profileOffsetDb[static_cast<size_t> (k)];
                 if (p.useIso226)
                     thr += iso226Db[static_cast<size_t> (k)];
 
-                if (isSibilanceBand && p.sibilanceSmooth > 0.05f)
-                {
-                    thr -= (4.0f * p.sibilanceSmooth);
-                }
 
-                // RULE 2: AGGRESSIVE THRESHOLD LOWERING FOR CUES
-                // If the user pushes a cue high, they are demanding reduction.
-                // We drop the threshold proportionally without a hard cap so that
-                // it can catch smooth high-end energy (not just sharp peaks).
-                thr -= (effectiveCue * 0.85f);
+
+                // CUE THRESHOLD DROP:
+                // Lower threshold proportionally so that user cues catch resonances aggressively.
+                if (hasCueWeighting)
+                {
+                    thr -= (effectiveCue * 0.85f);
+                }
 
                 float rawExcess = prominenceDb[static_cast<size_t> (k)] - thr;
                 if (rawExcess <= 0.0f)
@@ -374,31 +485,28 @@ namespace ResonaPro
                     continue;
                 }
 
-                // RULE 2: STRICT PROPORTIONAL SCALING
-                // This is the magic. The amount of reduction scales DIRECTLY with the cue size.
-                // A tiny 0.1 dB filter tail only produces a 0.016x multiplier (effectively 0).
-                // A +6 dB cue gives a 1.0x multiplier. A +12 dB cue gives 2.0x.
-                float cueScale = effectiveCue / 6.0f;
-
-                // RULE 3: HIGH-FREQUENCY SENSITIVITY FIX
-                // The user noted the high-end was not catching resonance. We boost the cue scale
-                // massively in the upper register to ensure immediate, surgical bite.
-                if (fHz >= 2500.0f)
-                {
-                    cueScale *= 2.5f;
-                }
-
-                cueScale = std::clamp(cueScale, 0.0f, 6.0f);
+                // Reduction scales from the neutral baseline of 1.0.
+                //   neutral band   0 dB  -> 1.0x, the designed behaviour
+                //   raised band   +6 dB  -> 2.0x
+                //   raised band  +18 dB  -> 4.0x, the ceiling
+                //   cut band      -6 dB  -> 0.0x, excluded
+                const float cueScale = std::clamp (1.0f + effectiveCue / 6.0f, 0.0f, 4.0f);
                 float excess = rawExcess * cueScale;
 
-                // Transient protection (lows/mids only)
-                if (fHz < 3000.0f)
+                // Transient protection: completely exclude percussive bins
+                if (percussiveFlags[static_cast<size_t>(k)])
                 {
-                    float transientPenalty = std::clamp (p.transientActivity, 0.0f, 1.0f)
-                                           * std::clamp (p.transientGuard, 0.0f, 1.0f) * 5.0f;
-                    if (transientPenalty > 0.0f)
+                    excess = 0.0f;
+                }
+                else
+                {
+                    const float transGuard = std::clamp (p.transientActivity, 0.0f, 1.0f)
+                                            * std::clamp (p.transientGuard, 0.0f, 1.0f);
+                    if (transGuard > 0.0f)
                     {
-                        excess = std::max(0.0f, excess - transientPenalty);
+                        float guardFactor = 0.99f * transGuard;
+
+                        excess *= std::clamp (1.0f - guardFactor, 0.01f, 1.0f);
                     }
                 }
 
@@ -410,10 +518,15 @@ namespace ResonaPro
                 }
 
                 // Note Motion protection (low registers only):
-                if (p.motionProtect > 0.0f && historyValid && previousPeriod >= 3.0f
+                if (p.motionProtect > 0.0f && historyValid && periodThen >= 3.0f
                     && periodSmooth >= 3.0f && fHz < 1500.0f)
                 {
-                    const float oldBin = k * previousPeriod / periodSmooth;
+                    // Where this bin's content sat when the note was at its old
+                    // pitch. This used to compare against the previous frame's
+                    // smoothed period, which is almost the same number, so the
+                    // offset was always under a bin and the control never fired.
+                    // A voice moves over tens of frames, not one.
+                    const float oldBin = k * periodThen / periodSmooth;
                     if (std::abs (oldBin - k) >= 1.0f && oldBin > 1.0f && oldBin < bins - 2)
                     {
                         const int j = static_cast<int> (oldBin);
@@ -435,6 +548,14 @@ namespace ResonaPro
             lastReferencePromDb = referenceProm;
             std::copy (magDb.begin(), magDb.end(), previousMagDb.begin());
             previousPeriod = periodSmooth;
+
+            // Push this frame's period and read the one from a full history back.
+            periodHistory[static_cast<size_t> (periodHistoryIdx)] = periodSmooth;
+            periodHistoryIdx = (periodHistoryIdx + 1) % periodHistoryLength;
+            if (periodHistoryCount < periodHistoryLength)
+                ++periodHistoryCount;
+            periodThen = periodHistory[static_cast<size_t> (periodHistoryIdx)];
+
             historyValid = true;
             (void) maxProm;
         }
@@ -444,14 +565,26 @@ namespace ResonaPro
         float getReferenceProminenceDb() const noexcept { return lastReferencePromDb; }
 
     private:
-        static void appendSamples (std::vector<float>& dest, int from, int to) noexcept
+        /** Gathers up to 16 evenly spaced samples from src over [from, to].
+
+            The values are what the caller needs. An earlier version pushed the bin
+            *index* instead, which turned the shoulder baseline into a number in the
+            hundreds and the prominence into a level-versus-position ratio. That made
+            prominence negative in every bin, so the detector never asked for any
+            reduction at all and the plug-in passed audio through untouched.
+        */
+        static void appendSamples (std::vector<float>& dest, const std::vector<float>& src,
+                                   int from, int to) noexcept
         {
+            const int last = static_cast<int> (src.size()) - 1;
+            from = std::max (0, from);
+            to   = std::min (last, to);
             if (from > to) return;
             const int count = to - from + 1;
             if (count <= 16)
             {
                 for (int i = from; i <= to; ++i)
-                    dest.push_back (static_cast<float> (i));
+                    dest.push_back (src[static_cast<size_t> (i)]);
                 return;
             }
             constexpr int TargetSamples = 16;
@@ -459,7 +592,7 @@ namespace ResonaPro
             for (int s = 0; s < TargetSamples; ++s)
             {
                 const int idx = from + static_cast<int> (std::lround (static_cast<float> (s) * step));
-                dest.push_back (static_cast<float> (idx));
+                dest.push_back (src[static_cast<size_t> (std::clamp (idx, 0, last))]);
             }
         }
 
@@ -528,6 +661,22 @@ namespace ResonaPro
         std::vector<float>  profileOffsetDb;
         std::vector<float>  iso226Db;
         std::vector<int>    radialBins;
+
+        // The period from several frames back, so Note Motion can see a note
+        // actually move rather than comparing adjacent frames.
+        static constexpr int periodHistoryLength = 8;
+        std::array<float, periodHistoryLength> periodHistory { };
+        int periodHistoryIdx   = 0;
+        int periodHistoryCount = 0;
+        float periodThen       = 0.0f;
+    public:
+        /** The analysis span, in bins, that the detector used per frequency on the
+            last frame. Exposed so the interface can draw the window the DETAIL
+            control is setting. Without a picture of it the knob has nothing
+            visible to move, which is exactly how it came to be reported as dead.
+        */
+        const std::vector<int>& getRadialBins() const noexcept { return radialBins; }
+    private:
         std::vector<double> prefix;
         std::vector<float>  prominenceDb;
         std::vector<float>  baselineDb;
@@ -535,6 +684,18 @@ namespace ResonaPro
         std::vector<float>  previousMagDb;
         std::vector<float>  magSmooth;
         std::vector<float>  shoulderScratch;
+
+        int temporalFrames = 1;
+        std::vector<float> prominenceHistory;
+        int historyWriteIdx = 0;
+        std::vector<float> temporalScratch;
+
+        int hpsFrames = 5;
+        std::vector<float> magHistory;
+        int magWriteIdx = 0;
+        std::vector<float> hpsScratch;
+        std::vector<float> vScratch;
+        std::vector<bool> percussiveFlags;
 
         float periodSmooth = 0.0f;
         float previousPeriod = 0.0f;
@@ -544,6 +705,5 @@ namespace ResonaPro
         std::vector<int>    peakPositions;
 
         float lastReferencePromDb = 0.0f;
-        float fullScaleReference = 1.0f;
     };
 }

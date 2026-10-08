@@ -19,6 +19,7 @@ namespace ResonaPro
             smoothedMag.fill(-100.0f);
             smoothedRed.fill(0.0f);
             smoothedBaseline.fill(-100.0f);
+            smoothedWindowHz.fill(0.0f);
             numericEntry.setMultiLine (false);
             numericEntry.setTextToShowWhenEmpty ("Hz  dB  Q", juce::Colours::grey);
             numericEntry.onReturnKey = [this]
@@ -60,18 +61,54 @@ namespace ResonaPro
             std::array<float, ResonaProAudioProcessor::ScopeSize> rawMag;
             std::array<float, ResonaProAudioProcessor::ScopeSize> rawRed;
             std::array<float, ResonaProAudioProcessor::ScopeSize> rawBase;
+            std::array<float, ResonaProAudioProcessor::ScopeSize> rawWindowHz;
             float refProm = 0.0f;
-            processor.getVisualizerData (rawMag, rawRed, rawBase, refProm);
+            processor.getVisualizerData (rawMag, rawRed, rawBase, rawWindowHz, refProm);
 
             for (size_t i = 0; i < numPoints; ++i)
             {
+                // Nothing non-finite gets past this point.
+                //
+                // These are recursive filters: each value is multiplied by a
+                // fraction and added back in every frame. A single -inf or NaN
+                // therefore never washes out -- it persists for the life of the
+                // editor, and the display goes dead while the audio carries on
+                // working normally. A gain of exactly zero converted to dB gives
+                // -inf, which is how a solo monitor managed to freeze the graph
+                // permanently. The engine no longer produces that value, and this
+                // is the second line of defence so the next one cannot either.
+                const float mIn = std::isfinite (rawMag[i])      ? rawMag[i]      : -100.0f;
+                const float rIn = std::isfinite (rawRed[i])      ? rawRed[i]      :    0.0f;
+                const float bIn = std::isfinite (rawBase[i])     ? rawBase[i]     : -100.0f;
+                const float wIn = std::isfinite (rawWindowHz[i]) ? rawWindowHz[i] :    0.0f;
+
                 // Asymmetric smoothing: fall fast, rise slowly, so the display reads
                 // like a real analyser instead of flickering.
-                const float aMag = rawMag[i] > smoothedMag[i] ? 0.55f : 0.20f;
-                const float aRed = rawRed[i] < smoothedRed[i] ? 0.55f : 0.20f;
-                smoothedMag[i]      = (1.0f - aMag) * smoothedMag[i] + aMag * rawMag[i];
-                smoothedRed[i]      = (1.0f - aRed) * smoothedRed[i] + aRed * rawRed[i];
-                smoothedBaseline[i] = 0.75f * smoothedBaseline[i] + 0.25f * rawBase[i];
+                const float aMag = mIn > smoothedMag[i] ? 0.55f : 0.20f;
+                const float aRed = rIn < smoothedRed[i] ? 0.55f : 0.20f;
+                smoothedMag[i]      = (1.0f - aMag) * smoothedMag[i] + aMag * mIn;
+                smoothedRed[i]      = (1.0f - aRed) * smoothedRed[i] + aRed * rIn;
+                smoothedBaseline[i] = 0.75f * smoothedBaseline[i] + 0.25f * bIn;
+                smoothedWindowHz[i] = 0.80f * smoothedWindowHz[i] + 0.20f * wIn;
+            }
+
+            // Smooth across frequency as well as in time. Per-bin smoothing alone
+            // leaves every harmonic peak as its own spike, which reads as a comb of
+            // needles rather than the shape of a voice. Two passes of a binomial
+            // kernel give a 9-point span: wide enough to read as a contour, narrow
+            // enough to keep the formant structure a user needs to aim at.
+            for (int pass = 0; pass < 2; ++pass)
+            {
+                // The reduction curve is included: the detector applies one gain
+                // across a band and then jumps, so the raw curve is a staircase.
+                // Smoothing it is what makes it read as a shape.
+                for (auto* curve : { &smoothedMag, &smoothedBaseline, &smoothedRed })
+                {
+                    auto& v = *curve;
+                    auto prev = v;
+                    for (size_t i = 1; i + 1 < numPoints; ++i)
+                        v[i] = 0.25f * prev[i - 1] + 0.5f * prev[i] + 0.25f * prev[i + 1];
+                }
             }
 
             referencePromDb = refProm;
@@ -95,7 +132,9 @@ namespace ResonaPro
 
             drawGrid(g, bounds);
             drawMagnitudeSpectrum(g, bounds);
+            drawAnalysisWindow(g, bounds);
             drawReductionCurve(g, bounds);
+            drawDetectedResonances(g, bounds);
             drawSidechainEQCurve(g, bounds);
             drawEQNodes(g, bounds);
             drawCursorReadout(g, bounds);
@@ -456,7 +495,7 @@ namespace ResonaPro
                 g.drawText(labels[i], labelX, static_cast<int>(bounds.getBottom() - 14), 30, 12, juce::Justification::centred);
             }
 
-            const float dBs[] = { 12.0f, 6.0f, 0.0f, -6.0f, -12.0f, -24.0f };
+            const float dBs[] = { 18.0f, 12.0f, 6.0f, 0.0f, -6.0f, -12.0f, -24.0f };
             for (float db : dBs)
             {
                 float y = gainToY(db, bounds.getHeight());
@@ -465,83 +504,210 @@ namespace ResonaPro
             }
         }
 
+        /** Display-only tilt compensation.
+            Music and speech fall by roughly 4.5 dB per octave, so an untilted
+            spectrum is a slope down to the right and reads as if the top end were
+            missing. Lifting each octave by a fixed amount flattens the display
+            without touching a sample of the audio.
+
+            The point-to-frequency mapping matches the processor: a log axis from
+            20 Hz to 20 kHz across the scope points.
+        */
+        static float displayTiltDb (int i)
+        {
+            constexpr float dbPerOctave = 4.5f;
+            const float norm = float (i) / float (numPoints - 1);
+            const float freq = 20.0f * std::pow (1000.0f, norm);
+            return dbPerOctave * std::log2 (juce::jmax (1.0f, freq) / 1000.0f);
+        }
+
+        /** Build a Catmull-Rom spline through the sampled curve.
+            Straight segments between 256 points read as a staircase wherever the
+            spectrum moves quickly, which is the part a user is looking at. A
+            spline through the same samples reads as a shape, and costs one cubic
+            per segment.
+        */
+        template <typename ValueFn>
+        static juce::Path buildSmoothPath (int count, ValueFn valueAt,
+                                           float x0, float dx,
+                                           float yMin, float yMax)
+        {
+            juce::Path path;
+            if (count < 2)
+                return path;
+
+            auto point = [&] (int i)
+            {
+                const int c = juce::jlimit (0, count - 1, i);
+                return juce::Point<float> (x0 + float (c) * dx,
+                                           juce::jlimit (yMin, yMax, valueAt (c)));
+            };
+
+            path.startNewSubPath (point (0));
+            for (int i = 0; i < count - 1; ++i)
+            {
+                const auto p0 = point (i - 1), p1 = point (i);
+                const auto p2 = point (i + 1), p3 = point (i + 2);
+                path.cubicTo (p1.x + (p2.x - p0.x) / 6.0f,
+                              p1.y + (p2.y - p0.y) / 6.0f,
+                              p2.x - (p3.x - p1.x) / 6.0f,
+                              p2.y - (p3.y - p1.y) / 6.0f,
+                              p2.x, p2.y);
+            }
+            return path;
+        }
+
         void drawMagnitudeSpectrum(juce::Graphics& g, juce::Rectangle<float> bounds)
         {
-            juce::Path magPath;
-            bool started = false;
-
-            for (size_t i = 0; i < numPoints; ++i)
+            const float dx = bounds.getWidth() / float (numPoints - 1);
+            auto magY = [&] (int i)
             {
-                float normX = static_cast<float>(i) / static_cast<float>(numPoints - 1);
-                float x = bounds.getX() + normX * bounds.getWidth();
-                float magDb = smoothedMag[i];
-                float y = juce::jmap(std::clamp(magDb, -70.0f, 10.0f), -70.0f, 10.0f, bounds.getBottom(), bounds.getY());
+                return juce::jmap (std::clamp (smoothedMag[size_t (i)] + displayTiltDb (i),
+                                               -80.0f, 20.0f),
+                                   -80.0f, 20.0f, bounds.getBottom(), bounds.getY());
+            };
 
-                if (!started)
-                {
-                    magPath.startNewSubPath(x, y);
-                    started = true;
-                }
-                else
-                {
-                    magPath.lineTo(x, y);
-                }
-            }
+            const juce::Path magPath = buildSmoothPath (int (numPoints), magY, bounds.getX(), dx,
+                                                        bounds.getY(), bounds.getBottom());
 
-            magPath.lineTo(bounds.getRight(), bounds.getBottom());
-            magPath.closeSubPath();
+            // Fill a closed copy, but stroke the open curve. Stroking the closed
+            // path also strokes the two closing edges, and the edge running back to
+            // the first sample drew a straight diagonal across the entire graph.
+            juce::Path fillPath = magPath;
+            fillPath.lineTo (bounds.getRight(), bounds.getBottom());
+            fillPath.closeSubPath();
 
             juce::ColourGradient fillGrad(juce::Colour(0x2a9b9384), bounds.getCentreX(), bounds.getY(),
                                           juce::Colour(0x02000000), bounds.getCentreX(), bounds.getBottom(), false);
             g.setGradientFill(fillGrad);
-            g.fillPath(magPath);
+            g.fillPath(fillPath);
 
             g.setColour(juce::Colour(0x559b9384));
-            g.strokePath(magPath, juce::PathStrokeType(1.0f));
+            g.strokePath(magPath, juce::PathStrokeType (1.2f, juce::PathStrokeType::curved,
+                                                        juce::PathStrokeType::rounded));
 
-            juce::Path basePath;
-            bool baseStarted = false;
-            for (size_t i = 0; i < numPoints; ++i)
+            auto baseY = [&] (int i)
             {
-                const float normX = static_cast<float>(i) / static_cast<float>(numPoints - 1);
-                const float x = bounds.getX() + normX * bounds.getWidth();
-                const float y = std::clamp (juce::jmap (smoothedBaseline[i], -60.0f, 10.0f,
-                                                        bounds.getBottom(), bounds.getY()),
-                                            bounds.getY(), bounds.getBottom());
-                if (! baseStarted) { basePath.startNewSubPath (x, y); baseStarted = true; }
-                else basePath.lineTo (x, y);
-            }
+                return juce::jmap (std::clamp (smoothedBaseline[size_t (i)] + displayTiltDb (i),
+                                               -80.0f, 20.0f),
+                                   -80.0f, 20.0f, bounds.getBottom(), bounds.getY());
+            };
+            juce::Path basePath = buildSmoothPath (int (numPoints), baseY, bounds.getX(), dx,
+                                                   bounds.getY(), bounds.getBottom());
             g.setColour (juce::Colour (0x44b3a892));
             g.strokePath (basePath, juce::PathStrokeType (1.0f, juce::PathStrokeType::curved));
         }
 
+        /** The span the detector looks over, drawn where the mouse is.
+            This is what the DETAIL control sets. Without it the knob had nothing
+            visible to move: it changed a window the user could not see, so it read
+            as doing nothing at all.
+        */
+        void drawAnalysisWindow (juce::Graphics& g, juce::Rectangle<float> bounds)
+        {
+            const int centre = isMouseInside
+                                 ? juce::jlimit (0, getWidth() - 1, currentMousePos.x)
+                                 : getWidth() / 2;
+
+            // Map the pixel back to a scope point, then read the window there.
+            const float frac = float (centre) / float (std::max (1, getWidth() - 1));
+            const int idx = juce::jlimit (0, int (numPoints) - 1,
+                                          int (frac * float (numPoints - 1) + 0.5f));
+
+            const float halfHz = smoothedWindowHz[size_t (idx)];
+            if (halfHz <= 0.0f)
+                return;
+
+            const float fNorm = float (idx) / float (numPoints - 1);
+            const float fHz   = 20.0f * std::pow (1000.0f, fNorm);
+
+            const float xL = freqToX (juce::jmax (20.0f, fHz - halfHz), bounds.getWidth());
+            const float xR = freqToX (juce::jmin (20000.0f, fHz + halfHz), bounds.getWidth());
+
+            const juce::Rectangle<float> band (bounds.getX() + xL, bounds.getY(),
+                                               juce::jmax (2.0f, xR - xL), bounds.getHeight());
+
+            g.setColour (juce::Colour (0x1e4a7fb5));
+            g.fillRect (band);
+            g.setColour (juce::Colour (0x665a8cc0));
+            g.drawVerticalLine (int (band.getX()), band.getY(), band.getBottom());
+            g.drawVerticalLine (int (band.getRight()), band.getY(), band.getBottom());
+
+            // Say how wide it is, so the number moves with the band.
+            juce::String txt;
+            if (halfHz >= 1000.0f)
+                txt = juce::String (halfHz * 2.0f / 1000.0f, 2) + " kHz window";
+            else
+                txt = juce::String (juce::roundToInt (halfHz * 2.0f)) + " Hz window";
+
+            g.setFont (juce::Font (juce::FontOptions (10.0f)));
+            g.setColour (juce::Colour (0xff4a7fb5));
+            g.drawText (txt, int (band.getX()) + 3, int (bounds.getY()) + 3, 130, 12,
+                        juce::Justification::centredLeft);
+        }
+
         void drawReductionCurve(juce::Graphics& g, juce::Rectangle<float> bounds)
         {
-            juce::Path redPath;
-            bool started = false;
-
-            for (size_t i = 0; i < numPoints; ++i)
+            const float dx = bounds.getWidth() / float (numPoints - 1);
+            auto redY = [&] (int i)
             {
-                float normX = static_cast<float>(i) / static_cast<float>(numPoints - 1);
-                float x = bounds.getX() + normX * bounds.getWidth();
-                float redDb = smoothedRed[i];
-                float y = gainToY(redDb, bounds.getHeight());
-
-                if (!started)
-                {
-                    redPath.startNewSubPath(x, y);
-                    started = true;
-                }
-                else
-                {
-                    redPath.lineTo(x, y);
-                }
-            }
+                return gainToY (smoothedRed[size_t (i)], bounds.getHeight());
+            };
+            juce::Path redPath = buildSmoothPath (int (numPoints), redY, bounds.getX(), dx,
+                                                  bounds.getY(), bounds.getBottom());
 
             juce::ColourGradient redGrad(juce::Colour(0xffc9762e), bounds.getX(), bounds.getY(),
                                          juce::Colour(0xffdda05c), bounds.getRight(), bounds.getY(), false);
             g.setGradientFill(redGrad);
             g.strokePath(redPath, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+
+        /** Marks the frequencies the engine is acting on.
+            Without this the graph shows a curve but not the decision behind it,
+            and a user cannot tell whether the plugin found a resonance or missed
+            one. Each mark is a short tick above the peak of a reduced region.
+        */
+        void drawDetectedResonances (juce::Graphics& g, juce::Rectangle<float> bounds)
+        {
+            const float thresholdDb = 0.75f;   // below this the curve is the floor, not a decision
+            const int   maxMarks    = 14;
+
+            juce::Path marks;
+            int count = 0;
+
+            for (size_t i = 1; i + 1 < numPoints && count < maxMarks; )
+            {
+                if (smoothedRed[i] <= thresholdDb) { ++i; continue; }
+
+                // Walk the run and remember where it peaks.
+                size_t runStart = i;
+                size_t peak = i;
+                while (i + 1 < numPoints && smoothedRed[i + 1] > thresholdDb)
+                {
+                    ++i;
+                    if (smoothedRed[i] > smoothedRed[peak]) peak = i;
+                }
+                const size_t runEnd = i;
+
+                // Only mark a run that stands on its own rather than a wide shelf.
+                const float width = float (runEnd - runStart + 1) / float (numPoints);
+                if (width < 0.35f)
+                {
+                    const float x = bounds.getX()
+                                  + (float (peak) / float (numPoints - 1)) * bounds.getWidth();
+                    const float y = gainToY (smoothedRed[peak], bounds.getHeight());
+                    marks.startNewSubPath (x, bounds.getY() + 2.0f);
+                    marks.lineTo (x, juce::jmax (y - 3.0f, bounds.getY() + 4.0f));
+                    ++count;
+                }
+                ++i;
+            }
+
+            if (count > 0)
+            {
+                g.setColour (juce::Colour (0xffc9762e).withAlpha (0.55f));
+                g.strokePath (marks, juce::PathStrokeType (1.0f));
+            }
         }
 
         void drawSidechainEQCurve(juce::Graphics& g, juce::Rectangle<float> bounds)
@@ -802,6 +968,7 @@ namespace ResonaPro
         std::array<float, numPoints> smoothedMag;
         std::array<float, numPoints> smoothedRed;
         std::array<float, numPoints> smoothedBaseline;
+        std::array<float, numPoints> smoothedWindowHz;
         float referencePromDb = 0.0f;
 
         int selectedNode = -1;

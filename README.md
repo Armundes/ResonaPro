@@ -8,10 +8,16 @@ with per-bin dynamics. It is built in C++20 with JUCE and uses Apple's `vDSP`
 for the transforms.
 
 Version 2.1 added an optional sidechain key, low-band analysis, a note-motion
-cue, and user-reviewed learning. Version 2.2.0 makes the MATCH button measure
-perceived loudness (ITU-R BS.1770 K-weighting) instead of raw RMS, and caps the
-correction so it can never raise the peak above what the input already had. Read
-the [FL Studio quick start](docs/HOW-TO-USE.md), the
+cue, and user-reviewed learning. Version 2.2.0 made the MATCH button measure
+perceived loudness (ITU-R BS.1770 K-weighting) instead of raw RMS, and capped the
+correction so it can never raise the peak above what the input already had.
+Version 2.3.0 repairs the detector itself. Its shoulder baseline was measuring
+bin positions rather than signal levels, which left the prominence negative in
+every bin and stopped the plug-in asking for any reduction at all. The full
+account is in the [status report](docs/PLUGIN-STATUS-REPORT.md).
+
+Read the [FL Studio quick start](docs/HOW-TO-USE.md), the
+[2.3.0 release notes](docs/V2.3.0-RELEASE-NOTES.md), the
 [2.1 release notes](docs/V2.1-RELEASE-NOTES.md), and the
 [audio-quality report](docs/AUDIO-QUALITY.md), which documents the measurements
 behind the transparency and level-matching claims. If you are coming from
@@ -207,8 +213,14 @@ ResonaPro/
 
 ## Hosts
 
-Built as AU, VST3 and Standalone on macOS, with arm64 and x86_64 slices.
+Shipped as AU, VST3 and Standalone on macOS, with arm64 and x86_64 slices.
 Processor tests cover mono/stereo layouts and a stereo optional sidechain bus.
 Apple's `auval` validates the installed AU. An automated test cannot stand in
 for a session in FL Studio or other hosts; scan the VST3 and test the sidechain
 routing in your DAW before relying on it in a release project.
+
+VST2 is supported by the build but is not included, because Steinberg stopped
+licensing and distributing the VST2 SDK in October 2018 and JUCE removed its
+bundled copy. If you have those headers, configure with
+`-DVST2_SDK_DIR=/path/to/vst2sdk` and VST2 joins the build; the installers pick
+it up automatically. Every current host, FL Studio included, loads the VST3.

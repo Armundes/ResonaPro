@@ -13,11 +13,19 @@
 
 #include "ResonanceDetector.h"
 #include "DynamicSuppressor.h"
+#include "SibilanceDeEsser.h"
 #include "ParametricEQWeighting.h"
 #include "TransientDetector.h"
 
 namespace ResonaPro
 {
+    /** Placeholder for Phase Three neural network fallback. */
+    struct NeuralDetector
+    {
+        bool isLoaded() const noexcept { return false; }
+        void process(const float* magIn, float* reductionOut, int numBins) { (void)magIn; (void)reductionOut; (void)numBins; }
+    };
+
     /** Weighted Overlap-Add (WOLA) short-time Fourier transform engine.
 
         Signal path (per channel):
@@ -47,10 +55,24 @@ namespace ResonaPro
     public:
         SpectralEngine() = default;
 
+        // The engine owns raw vDSP setup handles. The compiler would otherwise
+        // generate copy and move operations that merely duplicate those
+        // pointers, so two engines would each destroy the same handle and the
+        // second destroy aborts inside vDSP_destroy_fftsetup with "pointer being
+        // freed was not allocated". One engine, one handle.
+        SpectralEngine (const SpectralEngine&)            = delete;
+        SpectralEngine& operator= (const SpectralEngine&) = delete;
+        SpectralEngine (SpectralEngine&&)                 = delete;
+        SpectralEngine& operator= (SpectralEngine&&)      = delete;
+
         ~SpectralEngine()
         {
             freeFFT();
-            if (lowSetup != nullptr) vDSP_destroy_fftsetup (lowSetup);
+            if (lowSetup != nullptr)
+            {
+                vDSP_destroy_fftsetup (lowSetup);
+                lowSetup = nullptr;
+            }
         }
 
         struct Params
@@ -59,12 +81,15 @@ namespace ResonaPro
             float sharpness       = 1.0f;   // 0.2 .. 4
             float detailTilt      = 0.0f;   // -1 .. +1 (positive = surgical highs, broad lows)
             float selectivity     = 0.5f;   // 0 .. 1
+            float cutWidth        = 1.0f;   // 0 = tightest cut, 1 = full spread
+            float sibilanceAmount = 0.0f;   // 0 = off, 1 = full de-esser authority
+            float sibilanceLowHz  = 4000.0f;
+            float sibilanceHighHz = 16000.0f;
             float attackMs        = 8.0f;
             float releaseMs       = 70.0f;
             float attackTilt      = 0.0f;   // -1 .. +1 (positive = fast highs, slow lows)
             float releaseTilt     = 0.0f;   // -1 .. +1 (positive = fast high air recovery, long low hold)
             float maxReductionDb  = 24.0f;
-            float sibilanceSmooth = 0.5f;   // 0 .. 1 (dedicated S/T consonant smoother)
             float stereoLink      = 1.0f;   // 0 = dual mono, 1 = fully linked
             float transientGuard  = 0.5f;   // 0 .. 1
             ProcessingMode mode   = ProcessingMode::Soft;
@@ -72,6 +97,8 @@ namespace ResonaPro
             bool  useIso226       = true;
             bool  multiResolution = false;  // long low-band analysis; same synthesis latency
             float motionProtect   = 0.0f;   // frame-to-frame moving-harmonic protection
+            bool  neuralModeEnabled = false; // Phase Three DL router
+            bool  soloDeEss       = false;  // audition: play only what the de-esser removed
         };
 
         //==============================================================================
@@ -88,19 +115,34 @@ namespace ResonaPro
             numBins  = halfSize + 1;
             sr       = static_cast<float> (sampleRate > 0.0 ? sampleRate : 44100.0);
 
-            overlap = std::clamp (overlapFactor, 2, 8);
+            overlap = std::clamp (overlapFactor, 2, 16);
             hopSize = fftSize / overlap;
 
             setupFFT();
 
             window.resize (static_cast<size_t> (fftSize));
             for (int i = 0; i < fftSize; ++i)
-                window[static_cast<size_t> (i)] =
-                    std::sin (3.14159265358979323846f * (static_cast<float> (i) + 0.5f)
-                              / static_cast<float> (fftSize));
+            {
+                // Square root of a Hann window. The same window is used for
+                // analysis and synthesis, so their product is a Hann window,
+                // which satisfies the constant-overlap-add condition at every
+                // supported hop. A Blackman-Harris window was used here for a
+                // while: it has better sidelobe rejection for analysis, but it
+                // does not satisfy COLA, so the round trip stopped being unity
+                // gain and the "depth 0 is bit-transparent" guarantee (measured
+                // at 1e-7 before) turned into a 2.34 residual. Detection
+                // quality is handled inside the detector, not by sacrificing
+                // reconstruction.
+                const double x = juce::MathConstants<double>::pi
+                               * static_cast<double> (i + 0.5) / static_cast<double> (fftSize);
+                const double hann = 0.5 - 0.5 * std::cos (2.0 * x);
+                window[static_cast<size_t> (i)] = static_cast<float> (std::sqrt (hann));
+            }
 
-            synthesisScale = static_cast<float> (hopSize)
-                           / (static_cast<float> (fftSize) * static_cast<float> (fftSize));
+            // Derived rather than hard-coded: vDSP's real FFT round trip has a
+            // gain of 2N and the Hann COLA sum is N/(2*hop), so the scale that
+            // makes the round trip unity is hop / N^2.
+            synthesisScale = static_cast<float> (hopSize) / static_cast<float> (fftSize * fftSize);
 
             inputBufferL.assign (static_cast<size_t> (fftSize), 0.0f);
             inputBufferR.assign (static_cast<size_t> (fftSize), 0.0f);
@@ -125,18 +167,43 @@ namespace ResonaPro
             resonanceDbL.assign (static_cast<size_t> (numBins), 0.0f);
             resonanceDbR.assign (static_cast<size_t> (numBins), 0.0f);
             gainL.assign (static_cast<size_t> (numBins), 1.0f);
+            deEssPreL.assign (static_cast<size_t> (numBins), 1.0f);
+            deEssPreR.assign (static_cast<size_t> (numBins), 1.0f);
             gainR.assign (static_cast<size_t> (numBins), 1.0f);
             reductionDbL.assign (static_cast<size_t> (numBins), 0.0f);
             reductionDbR.assign (static_cast<size_t> (numBins), 0.0f);
             sidechainWeightsDb.assign (static_cast<size_t> (numBins), 0.0f);
+            
+            cepstralMag.assign(static_cast<size_t>(fftSize), 0.0f);
+            cepstralReal.assign(static_cast<size_t>(halfSize), 0.0f);
+            cepstralImag.assign(static_cast<size_t>(halfSize), 0.0f);
+            cepstralEnvL.assign(static_cast<size_t>(numBins), 0.0f);
+            cepstralEnvR.assign(static_cast<size_t>(numBins), 0.0f);
+            
+            weightsConfigured = false;
 
             binFreq.resize (static_cast<size_t> (numBins));
             const float binWidth = (sr * 0.5f) / static_cast<float> (numBins - 1);
             for (int k = 0; k < numBins; ++k)
                 binFreq[static_cast<size_t> (k)] = std::max (20.0f, static_cast<float> (k) * binWidth);
 
-            detectorL.prepare (numBins, sr);
-            detectorR.prepare (numBins, sr);
+            // Critical-band index per bin, used by applyBarkSmoothing. This has
+            // to be filled before measureLatency() below: that call pushes a
+            // block through the engine, which reaches applyBarkSmoothing, and
+            // reading an unallocated vector there dereferences a null pointer.
+            // Traunmuller's Bark formula spans 0 to about 24.6 over 20 Hz to
+            // 20 kHz, which matches the 25 bands the smoothing groups into.
+            binBark.assign (static_cast<size_t> (numBins), 0.0f);
+            for (int k = 0; k < numBins; ++k)
+            {
+                const float f = binFreq[static_cast<size_t> (k)];
+                const float z = 13.0f * std::atan (0.00076f * f)
+                              + 3.5f * std::atan ((f / 7500.0f) * (f / 7500.0f));
+                binBark[static_cast<size_t> (k)] = std::floor (juce::jlimit (0.0f, 24.0f, z));
+            }
+
+            detectorL.prepare (numBins, sr, hopSize);
+            detectorR.prepare (numBins, sr, hopSize);
             profileInitialized = false;
             // For the 1k/2k synthesis modes, analyse low frequencies with an
             // independent 4k FFT. The resulting *detection* curve is mapped back
@@ -146,6 +213,7 @@ namespace ResonaPro
             if (lowSize != 0)
             {
                 lowSetup = vDSP_create_fftsetup (12, FFT_RADIX2);
+                
                 lowRingL.assign (4096, 0.0f);
                 lowRingR.assign (4096, 0.0f);
                 lowKeyL.assign (4096, 0.0f);
@@ -158,25 +226,14 @@ namespace ResonaPro
                 lowMagnitude.assign (2049, 0.0f);
                 lowExcess.assign (2049, 0.0f);
                 lowWeights.assign (2049, 0.0f);
-                lowDetector.prepare (2049, sr);
-                lowDetectorR.prepare (2049, sr);
-                double sum = 0.0;
-                for (float w : lowWindow) sum += w;
-                lowDetector.setFullScaleReference (static_cast<float> (sum * 0.5));
-                lowDetectorR.setFullScaleReference (static_cast<float> (sum * 0.5));
+                lowDetector.prepare (2049, sr, 1024);
+                lowDetectorR.prepare (2049, sr, 1024);
             }
             suppressorL.prepare (numBins, sr, hopSize, binFreq);
+            deEsserL.prepare (numBins, sr, hopSize, binFreq);
             suppressorR.prepare (numBins, sr, hopSize, binFreq);
+            deEsserR.prepare (numBins, sr, hopSize, binFreq);
             transientDetector.prepare (sr);
-
-            // Magnitude the FFT would report for a full-scale sine at a bin centre:
-            // used to express magnitudes on an approximate dBFS scale for Hard mode.
-            double windowSum = 0.0;
-            for (int i = 0; i < fftSize; ++i)
-                windowSum += static_cast<double> (window[static_cast<size_t> (i)]);
-            const float fullScaleMag = static_cast<float> (0.5 * windowSum);
-            detectorL.setFullScaleReference (fullScaleMag);
-            detectorR.setFullScaleReference (fullScaleMag);
 
             reset();
 
@@ -185,6 +242,66 @@ namespace ResonaPro
 
             reset();
         }
+
+        // ---- Phase 8: learn the take's sibilance ---------------------------
+        // The editor's Learn button captures focus bands from the visualiser
+        // scope, which is log-spaced and lossy. Sibilance needs the real FFT
+        // magnitudes and the real bin frequencies, so the profile is built here
+        // where both exist. Nothing changes until the user applies it.
+        void beginSibilanceLearn() noexcept
+        {
+            deEsserL.beginLearn();
+            sibLearning = true;
+        }
+
+        SibilanceDeEsser::Profile endSibilanceLearn() noexcept
+        {
+            sibLearning = false;
+            return deEsserL.endLearn();
+        }
+
+        bool isSibilanceLearning() const noexcept { return sibLearning; }
+
+        // ---- onset and decay, measured at the transform rate ----------------
+        //
+        // The editor's scope publishes 20 frames a second, so one frame is 50 ms.
+        // Onset and release are millisecond-scale, so that rate cannot resolve
+        // them and every learned timing came out pinned to its ceiling. The
+        // engine sees every transform frame -- 10.7 ms at 2048/4x, 5.3 ms at
+        // 8x -- so the timing is measured here and handed up finished.
+        //
+        // A few passes over the bin array per frame, only while a take is being
+        // learned. Playback is untouched.
+        void beginTimingLearn() noexcept
+        {
+            timingLearning    = true;
+            timingOnsetSum    = 0; timingOnsetCount = 0;
+            timingRingSum     = 0; timingRingCount  = 0;
+            timingRiseFrames  = 0; timingDecayFrames = 0;
+            timingEventActive = false;
+        }
+
+        void endTimingLearn() noexcept { timingLearning = false; }
+
+        /** Mean rise time of events seen during the learn window, in ms. */
+        float getLearnOnsetMs() const noexcept
+        {
+            if (timingOnsetCount == 0) return 0.0f;
+            return float (double (timingOnsetSum) / double (timingOnsetCount)
+                          * timingMsPerFrame());
+        }
+
+        /** Mean decay time of events seen during the learn window, in ms. */
+        float getLearnRingMs() const noexcept
+        {
+            if (timingRingCount == 0) return 0.0f;
+            return float (double (timingRingSum) / double (timingRingCount)
+                          * timingMsPerFrame());
+        }
+
+        /** Where the de-esser has tracked the sibilance to, in Hz. 0 if none. */
+        float getSibilanceCentreHz() const noexcept { return deEsserL.getTrackedCentreHz(); }
+
 
         void reset()
         {
@@ -209,7 +326,9 @@ namespace ResonaPro
             keyEnabled = false;
 
             suppressorL.reset();
+            deEsserL.reset();
             suppressorR.reset();
+            deEsserR.reset();
             transientDetector.reset();
             detectorL.resetHistory();
             detectorR.resetHistory();
@@ -244,6 +363,7 @@ namespace ResonaPro
         {
             eq.computeWeightingDb (sidechainWeightsDb.data(), numBins, sr);
             if (lowSize != 0) eq.computeWeightingDb (lowWeights.data(), 2049, sr);
+            weightsConfigured = true;
         }
 
         //==============================================================================
@@ -347,6 +467,7 @@ namespace ResonaPro
         const float* getMagnitudeSpectrum() const noexcept { return magnitudeL.data(); }
         const float* getReductionDb()       const noexcept { return reductionDbL.data(); }
         const float* getBaselineDb()        const noexcept { return detectorL.getBaselineDb(); }
+        const int*   getWindowBins()        const noexcept { return detectorL.getRadialBins().data(); }
         const float* getProminenceDb()      const noexcept { return detectorL.getProminenceDb(); }
         const float* getResonanceDb()       const noexcept { return resonanceDbL.data(); }
         float getReferenceProminenceDb()    const noexcept { return detectorL.getReferenceProminenceDb(); }
@@ -416,7 +537,6 @@ namespace ResonaPro
             dp.sharpness         = params.sharpness;
             dp.detailTilt        = params.detailTilt;
             dp.selectivity       = params.selectivity;
-            dp.sibilanceSmooth   = params.sibilanceSmooth;
             dp.transientGuard    = params.transientGuard;
             dp.transientActivity = activity;
             dp.useIso226         = params.useIso226;
@@ -431,6 +551,7 @@ namespace ResonaPro
             sp.attackTilt     = params.attackTilt;
             sp.releaseTilt    = params.releaseTilt;
             sp.maxReductionDb = params.maxReductionDb;
+            sp.cutWidth       = params.cutWidth;
             sp.mode           = params.mode;
 
             analyzeChannel (inputBufferL, realL, imagL, magnitudeL);
@@ -455,6 +576,7 @@ namespace ResonaPro
                 for (int k = 0; k < numBins; ++k)
                     blendedMag[static_cast<size_t> (k)] = 0.5f * (detectL[static_cast<size_t> (k)]
                                                                 + detectR[static_cast<size_t> (k)]);
+                computeTrueEnvelope(blendedMag, cepstralEnvL);
             }
             else
             {
@@ -462,12 +584,24 @@ namespace ResonaPro
                     blendedMag[static_cast<size_t> (k)] =
                         link * 0.5f * (detectL[static_cast<size_t> (k)] + detectR[static_cast<size_t> (k)])
                         + (1.0f - link) * detectL[static_cast<size_t> (k)];
+                computeTrueEnvelope(blendedMag, cepstralEnvL);
             }
-            detectorL.detect (blendedMag.data(), sidechainWeightsDb.data(), resonanceDbL.data(), dp);
+            const float* cueWeights = weightsConfigured ? sidechainWeightsDb.data() : nullptr;
+            const float* lowCueWeights = weightsConfigured ? lowWeights.data() : nullptr;
+
+            if (params.neuralModeEnabled && neuralDetector.isLoaded())
+            {
+                neuralDetector.process(blendedMag.data(), resonanceDbL.data(), numBins);
+            }
+            else
+            {
+                detectorL.detect (blendedMag.data(), cepstralEnvL.data(), cueWeights, resonanceDbL.data(), dp);
+            }
+            
             if (params.multiResolution && lowSize != 0 && lowSetup != nullptr)
             {
                 analyzeLowBand (keyEnabled ? lowKeyL : lowRingL);
-                lowDetector.detect (lowMagnitude.data(), lowWeights.data(), lowExcess.data(), dp);
+                lowDetector.detect (lowMagnitude.data(), nullptr, lowCueWeights, lowExcess.data(), dp);
                 // Only blend the low-frequency decision. The two windows finish at
                 // the same sample, so the synthesis path stays phase-coherent.
                 const float ratio = 4096.0f / static_cast<float> (fftSize);
@@ -481,6 +615,8 @@ namespace ResonaPro
                         (lowExcess[static_cast<size_t> (lk)] - resonanceDbL[static_cast<size_t> (k)]);
                 }
             }
+            
+            applyBarkSmoothing(resonanceDbL);
             suppressorL.process (resonanceDbL.data(), gainL.data(), sp);
 
             if (fullyLinked)
@@ -494,11 +630,21 @@ namespace ResonaPro
                     blendedMag[static_cast<size_t> (k)] =
                         link * 0.5f * (detectL[static_cast<size_t> (k)] + detectR[static_cast<size_t> (k)])
                         + (1.0f - link) * detectR[static_cast<size_t> (k)];
-                detectorR.detect (blendedMag.data(), sidechainWeightsDb.data(), resonanceDbR.data(), dp);
+                computeTrueEnvelope(blendedMag, cepstralEnvR);
+                
+                if (params.neuralModeEnabled && neuralDetector.isLoaded())
+                {
+                    neuralDetector.process(blendedMag.data(), resonanceDbR.data(), numBins);
+                }
+                else
+                {
+                    detectorR.detect (blendedMag.data(), cepstralEnvR.data(), cueWeights, resonanceDbR.data(), dp);
+                }
+                
                 if (params.multiResolution && lowSize != 0 && lowSetup != nullptr)
                 {
                     analyzeLowBand (keyEnabled ? lowKeyR : lowRingR);
-                    lowDetectorR.detect (lowMagnitude.data(), lowWeights.data(), lowExcess.data(), dp);
+                    lowDetectorR.detect (lowMagnitude.data(), nullptr, lowCueWeights, lowExcess.data(), dp);
                     const float ratio = 4096.0f / static_cast<float> (fftSize);
                     for (int k = 1; k < numBins; ++k)
                     {
@@ -510,6 +656,7 @@ namespace ResonaPro
                             (lowExcess[static_cast<size_t> (lk)] - resonanceDbR[static_cast<size_t> (k)]);
                     }
                 }
+                applyBarkSmoothing(resonanceDbR);
                 suppressorR.process (resonanceDbR.data(), gainR.data(), sp);
 
                 // Stereo Reverb & Space Preservation in Mid/Side Mode:
@@ -527,8 +674,81 @@ namespace ResonaPro
                 }
             }
 
+            // Phase locking was removed here. It wrote one float past the end of
+            // the split-complex buffers on every frame (rightBound reached
+            // numBins while realL/imagL hold halfSize == numBins - 1), which
+            // corrupted the heap and produced random crashes at random points in
+            // the suite. It was also a no-op: `rotation` was hardcoded to 0, so
+            // each bin was rebuilt from its own magnitude and phase. It cost two
+            // vDSP calls, four heap allocations per frame on the audio thread and
+            // a peak scan, and changed nothing. Real identity phase locking
+            // (Laroche and Dolson 1999) needs rotation = phases[peak] -
+            // phases[k] and writes clamped to the buffer size; see
+            // RESEARCH-SYNTHESIS-OPTIONS.md if listening ever demands it.
+            // The de-esser runs as its own stage on top of the resonance gain.
+            // It is deliberately not expressed through the resonance detector:
+            // sibilance is a wide band of noise, not a peak, and the detector's
+            // whole design is about peaks. See docs/FINE-TUNE-AUDIT.md.
+            {
+                // Keep the resonance gain, so whatever the de-esser does on top
+                // of it can be separated out. Solo the Cut plays only that part.
+                std::copy (gainL.begin(), gainL.end(), deEssPreL.begin());
+                std::copy (gainR.begin(), gainR.end(), deEssPreR.begin());
+
+                SibilanceDeEsser::Params sp2;
+                sp2.amount  = params.sibilanceAmount;
+                sp2.lowHz   = params.sibilanceLowHz;
+                sp2.highHz  = params.sibilanceHighHz;
+                deEsserL.process (detectL.data(), gainL.data(), sp2);
+                deEsserR.process (detectR.data(), gainR.data(), sp2);
+
+                if (params.soloDeEss)
+                {
+                    // Play what the de-esser removed, and nothing else.
+                    //
+                    // The resonance suppression is dropped from the path, so the
+                    // only thing audible is the de-esser's own subtraction. Where
+                    // it did nothing the output is silent; where it cut 12 dB you
+                    // hear the 12 dB it took. That is what makes it possible to
+                    // hear whether a vowel is leaking into the cut, which is the
+                    // question the flatness gate was built to answer.
+                    //
+                    // The gain is divided rather than recomputed, so this cannot
+                    // disagree with the cut that is actually being applied.
+                    auto soloInto = [this] (const std::vector<float>& pre,
+                                               std::vector<float>& g,
+                                               std::vector<float>& red)
+                    {
+                        for (int k = 0; k < numBins; ++k)
+                        {
+                            const auto u = static_cast<size_t> (k);
+                            const float p = pre[u];
+                            const float own = p > 1.0e-6f ? g[u] / p : 1.0f;
+                            // Floored, not clamped to zero. A gain of exactly
+                            // zero becomes -inf when synthesizeChannel converts
+                            // it to dB for the graph, and a -inf reaching the
+                            // visualiser's recursive smoothing filter never
+                            // washes out -- the display goes dead permanently
+                            // while the audio carries on working. That is what
+                            // toggling Solo Cut in and out used to do. -120 dB
+                            // is inaudible and finite.
+                            const float rem = std::clamp (1.0f - own, 1.0e-6f, 1.0f);
+                            g[u] = rem;
+                            red[u] = rem > 1.0e-6f
+                                   ? -20.0f * std::log10 (std::max (1.0e-6f, own))
+                                   : 0.0f;
+                        }
+                    };
+                    soloInto (deEssPreL, gainL, reductionDbL);
+                    soloInto (deEssPreR, gainR, reductionDbR);
+                }
+            }
+
             synthesizeChannel (outputBufferL, realL, imagL, gainL, reductionDbL);
             synthesizeChannel (outputBufferR, realR, imagR, gainR, reductionDbR);
+
+            if (timingLearning)
+                updateTimingLearn (reductionDbL);
 
             outBufferWritePos += hopSize;
             if (outBufferWritePos >= fftSize * 2)
@@ -614,12 +834,142 @@ namespace ResonaPro
             }
         }
 
+        void computeTrueEnvelope(const std::vector<float>& magIn, std::vector<float>& envOut) noexcept
+        {
+            for (int k = 0; k < numBins; ++k)
+                cepstralMag[k] = magIn[k] > 1e-6f ? std::log(magIn[k]) : -13.81f;
+            
+            for (int k = 1; k < halfSize; ++k)
+                cepstralMag[fftSize - k] = cepstralMag[k];
+
+            DSPSplitComplex splitComplex { cepstralReal.data(), cepstralImag.data() };
+            vDSP_ctoz (reinterpret_cast<const DSPComplex*> (cepstralMag.data()), 2, &splitComplex, 1, static_cast<vDSP_Length>(halfSize));
+            
+            vDSP_fft_zrip (fftSetup, &splitComplex, 1, static_cast<vDSP_Length>(log2n), FFT_FORWARD);
+            
+            int lifterCutoff = 45;
+            for (int i = lifterCutoff; i < halfSize; ++i)
+            {
+                cepstralReal[i] = 0.0f;
+                cepstralImag[i] = 0.0f;
+            }
+            
+            vDSP_fft_zrip (fftSetup, &splitComplex, 1, static_cast<vDSP_Length>(log2n), FFT_INVERSE);
+            vDSP_ztoc (&splitComplex, 1, reinterpret_cast<DSPComplex*> (cepstralMag.data()), 2, static_cast<vDSP_Length>(halfSize));
+            
+            const float scale = 1.0f / (2.0f * static_cast<float>(fftSize));
+            for (int k = 0; k < numBins; ++k)
+            {
+                envOut[k] = std::exp(cepstralMag[k] * scale);
+            }
+        }
+
+        void applyBarkSmoothing(std::vector<float>& gainDb) noexcept
+        {
+            const int numBarkBands = 25;
+            std::array<float, 25> barkSum { 0.0f };
+            std::array<float, 25> barkCount { 0.0f };
+
+            for (int k = 0; k < numBins; ++k) {
+                int b = static_cast<int>(binBark[k]);
+                if (b >= 0 && b < numBarkBands) {
+                    barkSum[b] += gainDb[k];
+                    barkCount[b] += 1.0f;
+                }
+            }
+            std::array<float, 25> barkGain { 0.0f };
+            for (int b = 0; b < numBarkBands; ++b) {
+                if (barkCount[b] > 0.0f)
+                    barkGain[b] = barkSum[b] / barkCount[b];
+            }
+
+            std::array<float, 25> smoothedBark { 0.0f };
+            for (int b = 0; b < numBarkBands; ++b) {
+                float sum = 0.0f;
+                float wSum = 0.0f;
+                for (int i = -1; i <= 1; ++i) {
+                    if (b + i >= 0 && b + i < numBarkBands) {
+                        float w = (i == 0) ? 0.5f : 0.25f;
+                        sum += barkGain[b + i] * w;
+                        wSum += w;
+                    }
+                }
+                smoothedBark[b] = sum / wSum;
+            }
+
+            for (int k = 0; k < numBins; ++k) {
+                float b = binBark[k];
+                int b0 = static_cast<int>(b);
+                int b1 = std::min(numBarkBands - 1, b0 + 1);
+                float t = b - static_cast<float>(b0);
+                gainDb[k] = smoothedBark[b0] * (1.0f - t) + smoothedBark[b1] * t;
+            }
+        }
+
         //==============================================================================
         int   log2n    = 11;
         int   fftSize  = 2048;
         int   halfSize = 1024;
         int   numBins  = 1025;
         int   hopSize  = 512;
+
+        // ---- timing capture state ----
+        bool  timingLearning    = false;
+        int   timingRiseFrames  = 0, timingOnsetSum = 0, timingOnsetCount = 0;
+        int   timingDecayFrames = 0, timingRingSum = 0, timingRingCount  = 0;
+        bool  timingEventActive = false;
+
+        double timingMsPerFrame() const noexcept
+        {
+            return sr > 0.0f ? 1000.0 * double (hopSize) / double (sr) : 0.0;
+        }
+
+        /** One transform frame of the event machine.
+            The cut depth stands in for the problem's presence: when a resonance
+            arrives the cut arrives with it, and when the resonance rings the cut
+            persists. Frames are 5-11 ms apart here, so the rise and decay times
+            carry real meaning instead of landing on a ceiling. */
+        void updateTimingLearn (const std::vector<float>& reductionDb) noexcept
+        {
+            float excess = 0.0f;
+            for (size_t k = 0; k < reductionDb.size(); ++k)
+                excess = std::max (excess, -reductionDb[k]);
+
+            if (! timingEventActive)
+            {
+                if (excess > kTimingEndDb)
+                {
+                    ++timingRiseFrames;
+                    if (excess > kTimingOnsetDb && timingRiseFrames >= kTimingMinFrames)
+                    {
+                        timingOnsetSum += timingRiseFrames;
+                        ++timingOnsetCount;
+                        timingEventActive = true;
+                        timingRiseFrames  = 0;
+                        timingDecayFrames = 0;
+                    }
+                }
+                else
+                {
+                    timingRiseFrames = 0;
+                }
+            }
+            else
+            {
+                ++timingDecayFrames;
+                if (excess < kTimingEndDb)
+                {
+                    timingRingSum += timingDecayFrames;
+                    ++timingRingCount;
+                    timingEventActive = false;
+                    timingDecayFrames = 0;
+                }
+            }
+        }
+
+        static constexpr float kTimingOnsetDb   = 1.5f;
+        static constexpr float kTimingEndDb     = 0.5f;
+        static constexpr int   kTimingMinFrames = 2;
         int   overlap  = 4;
         int   latency  = 2048;
         float sr       = 44100.0f;
@@ -647,7 +997,16 @@ namespace ResonaPro
         std::vector<float> gainL, gainR;
         std::vector<float> reductionDbL, reductionDbR;
         std::vector<float> sidechainWeightsDb;
+        
+        std::vector<float> cepstralMag;
+        std::vector<float> cepstralReal;
+        std::vector<float> cepstralImag;
+        std::vector<float> cepstralEnvL;
+        std::vector<float> cepstralEnvR;
+
+        bool weightsConfigured = false;
         std::vector<float> binFreq;
+        std::vector<float> binBark;
         std::vector<float> scratchIn, scratchOut;
 
         std::vector<float> inputBufferL, inputBufferR;
@@ -661,7 +1020,14 @@ namespace ResonaPro
         int   frameTransientCount = 0;
 
         ResonanceDetector detectorL, detectorR;
+        NeuralDetector neuralDetector;
         DynamicSuppressor suppressorL, suppressorR;
+        SibilanceDeEsser  deEsserL, deEsserR;
+
+        // The resonance gain as it stood before the de-esser ran, so the
+        // de-esser's own contribution can be isolated for Solo the Cut.
+        std::vector<float> deEssPreL, deEssPreR;
+        bool sibLearning = false;   // Phase 8: accumulate the take's profile
         TransientDetector transientDetector;
     };
 }

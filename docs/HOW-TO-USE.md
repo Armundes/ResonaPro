@@ -2,7 +2,7 @@
 
 ## 1. Getting it into your DAW
 
-**ResonaPro 2.2.0 is the current build.** It sits in
+**ResonaPro 2.3.0 is the current build.** It sits in
 `~/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/Components`, and
 Apple's `auval` validator accepts the AU. You only need this section if you
 rebuild the plugin later, or want it on another machine.
@@ -15,9 +15,17 @@ of the binary that is actually running.
 |---|---|---|
 | VST3 | `~/Library/Audio/Plug-Ins/VST3/ResonaPro.vst3` | FL Studio scans this folder by default. Use this one. |
 | AU | `~/Library/Audio/Plug-Ins/Components/ResonaPro.component` | For Logic, GarageBand and other Audio Unit hosts. |
+| VST2 | `~/Library/Audio/Plug-Ins/VST/ResonaPro.vst` | Only present if the build was given a VST2 SDK. Not shipped. |
 | Standalone | `/Applications/ResonaPro.app` | Launch it from Spotlight, Launchpad or Finder. No DAW needed. |
 
-If the version text reads anything other than **v2.2.0**, the host is running a
+Three formats ship: AU, VST3 and standalone. VST2 is not among them. Steinberg
+stopped licensing and distributing the VST2 SDK in October 2018, and JUCE
+removed its bundled copy, so a VST2 build needs those headers supplied by
+whoever builds it. The build and both installers are ready for it the moment
+they are available. In practice it rarely matters: FL Studio, Logic, Ableton,
+Cubase, Studio One and Reaper all load the VST3 or the AU.
+
+If the version text reads anything other than **v2.3.0**, the host is running a
 cached copy and needs to rescan. The FL Studio steps are at the end of this
 section.
 

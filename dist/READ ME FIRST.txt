@@ -1,0 +1,117 @@
+ResonaPro 2.3.0
+A dynamic vocal resonance suppressor. Audio Unit, VST3 and standalone for macOS.
+
+
+WHAT IS IN HERE
+---------------
+
+  Install ResonaPro.pkg        the installer package. Needs an admin password.
+  Install ResonaPro.command    a script that installs without a password
+  READ ME FIRST.txt            this guide
+
+  ResonaPro.component          Audio Unit (AU) for Apple Logic Pro & GarageBand
+  ResonaPro.vst3               VST3 for Ableton Live, FL Studio, Cubase, Reaper
+  ResonaPro.app                Standalone application (no DAW needed)
+
+Everything needed for both installation routes is self-contained in this package.
+
+
+HOW TO INSTALL
+--------------
+
+There are two ways to install. Both install the exact same plug-in. Use Option 1
+unless you don't have administrator permissions.
+
+--------------------------------------------------------------------
+OPTION 1 - The Installer Package (Recommended for all users)
+--------------------------------------------------------------------
+
+  1. Double-click "Install ResonaPro.pkg".
+
+  2. If macOS warns that it "cannot be opened because it is from an unidentified developer":
+     This is standard for independently developed plug-ins not sold through the Mac App Store.
+     To open:
+        a. Right-click (or Control-click) "Install ResonaPro.pkg"
+        b. Choose "Open" from the menu
+        c. Click "Open" in the security prompt
+
+     Alternatively: Open System Settings -> Privacy & Security -> scroll down to
+     "Security" and click "Open Anyway".
+
+  3. Enter your Mac password when prompted. The package installs system-wide:
+        /Library/Audio/Plug-Ins/Components/ResonaPro.component  (Audio Unit)
+        /Library/Audio/Plug-Ins/VST3/ResonaPro.vst3             (VST3)
+        /Applications/ResonaPro.app                            (Standalone)
+
+--------------------------------------------------------------------
+OPTION 2 - The Script (No Administrator Password Needed)
+--------------------------------------------------------------------
+
+  Use this if your account does not have admin permissions.
+
+  1. Drag the entire DMG folder or contents onto your Desktop or Downloads.
+     (Do not run it directly from a read-only DMG volume).
+
+  2. Right-click "Install ResonaPro.command" and choose "Open".
+
+  3. Click "Open" in the dialog. The script will automatically copy the plug-ins,
+     clear quarantine flags, and register the Audio Unit for your user account:
+        ~/Library/Audio/Plug-Ins/Components/ResonaPro.component
+        ~/Library/Audio/Plug-Ins/VST3/ResonaPro.vst3
+        ~/Applications/ResonaPro.app
+
+
+USING IN LOGIC PRO
+------------------
+
+  1. Open Logic Pro.
+  2. On any audio track or vocal track, click an empty Audio FX slot:
+        Audio FX -> Audio Units -> ResonaAudio -> ResonaPro -> Stereo (or Mono)
+
+  IF LOGIC PRO DOES NOT SHOW RESONAPRO:
+  ------------------------------------
+  Audio Units in Logic are cached by macOS. If Logic was open during install
+  or the cache needs updating:
+
+  Method A: In Logic Pro:
+    1. Go to Logic Pro menu -> Settings (or Preferences) -> Plug-in Manager...
+    2. In the left column under "Manufacturer", find "ResonaAudio".
+    3. Click "ResonaAudio", then select "ResonaPro" on the right.
+    4. Click "Reset & Rescan Selection" at the bottom of the window.
+    5. The compatibility should show "successfully validated".
+
+  Method B: Terminal Refresh (Quick reset):
+    1. Quit Logic Pro.
+    2. Open Terminal and run:
+         killall -9 AudioComponentRegistrar
+    3. Relaunch Logic Pro. Logic will automatically rescan new components.
+
+
+HOW RESONAPRO WORKS (QUICK START)
+---------------------------------
+
+  * Selective Focus Bands:
+    ResonaPro uses focus-cue gating. When all 8 focus bands are flat (at 0 dB),
+    the audio passes through 100% clean and transparent (0.00 dB reduction).
+    To target problematic harshness or room resonances, raise one or more focus
+    band nodes in the problem area (e.g., sibilance at 6-8 kHz or harsh mids at 2-4 kHz).
+
+  * DEPTH:
+    Controls the overall suppression depth applied to resonances detected within
+    your active focus bands.
+
+  * DELTA:
+    Toggles audition mode to hear ONLY the harsh resonances being removed from
+    the vocal. Toggle it on to verify you are cutting resonances and not vocal body.
+
+  * QUALITY & RESPONSE:
+    - Quality: Standard (1024-pt FFT), High (2048-pt FFT), Ultra (4096-pt FFT).
+    - Response: Fast (2x overlap), Balanced (4x overlap), Smooth (8x overlap).
+
+
+COMPATIBILITY & SPECS
+---------------------
+  * Platform: macOS 11 Big Sur, macOS 12 Monterey, macOS 13 Ventura, macOS 14 Sonoma, macOS 15 Sequoia
+  * Architecture: Universal Binary (Native Apple Silicon M1/M2/M3/M4 & Intel x86_64)
+  * Format: Audio Unit 64-bit (AUv2 aufx RsnP ResA), VST3, Standalone
+  * Validation: 100% auval passed (format, render, slice, and parameter checks)

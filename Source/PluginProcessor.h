@@ -9,11 +9,13 @@
 #include <vector>
 
 #include "DSP/SpectralEngine.h"
+#include "DSP/TrackingEngine.h"
 #include "DSP/ParametricEQWeighting.h"
 
 namespace ResonaPro
 {
     class ResonaProAudioProcessor : public juce::AudioProcessor,
+                                    public juce::AudioProcessorValueTreeState::Listener,
                                     private juce::AsyncUpdater
     {
     public:
@@ -43,6 +45,25 @@ namespace ResonaPro
         void getStateInformation (juce::MemoryBlock& destData) override;
         void setStateInformation (const void* data, int sizeInBytes) override;
 
+        /** Phase 8: profile the take's sibilance. Call from the message thread;
+            the audio thread only accumulates. Nothing is applied until the user
+            accepts the result.
+        */
+        /** The fence around LEARN. Returns true only for the parameters a take
+            analysis is allowed to propose. Everything else -- resolution, hard
+            mode, mid/side, delta, the vocal weighting, output, stereo link, mix
+            -- is a session decision and is refused. Tested in Tests/.
+        */
+        static bool isLearnEditable (const juce::String& paramId);
+        static const juce::StringArray& learnEditableIds();
+
+        void startSibilanceLearn() noexcept;
+        SibilanceDeEsser::Profile finishSibilanceLearn() noexcept;
+        // Onset and decay of the problems in the take, measured by the engine at
+        // the transform rate. Valid after finishSibilanceLearn.
+        float getEngineLearnOnsetMs() const noexcept;
+        float getEngineLearnRingMs()   const noexcept;
+
         juce::AudioProcessorValueTreeState apvts;
 
         //==============================================================================
@@ -57,6 +78,7 @@ namespace ResonaPro
         void getVisualizerData (std::array<float, ScopeSize>& magnitudeDbOut,
                                 std::array<float, ScopeSize>& reductionDbOut,
                                 std::array<float, ScopeSize>& baselineDbOut,
+                                std::array<float, ScopeSize>& windowHzOut,
                                 float& referenceProminenceDbOut,
                                 uint64_t* frameSequenceOut = nullptr);
 
@@ -75,6 +97,7 @@ namespace ResonaPro
         void setParameterValue (const juce::String& paramID, float value);
 
     private:
+        void parameterChanged (const juce::String& parameterID, float newValue) override;
         void handleAsyncUpdate() override;
         void cacheParameterPointers();
         void updateLatencyAndDisplay();
@@ -90,8 +113,22 @@ namespace ResonaPro
 
         /** One fully prepared engine per (quality, response) combination, so that
             changing either control on the fly never allocates on the audio thread.
+
+            One SpectralEngine per combination, not a dual-band wrapper. Analysis
+            and synthesis happen in a single WOLA path: a second synthesis path
+            behind a crossover cannot sum back to the input, so depth 0 stopped
+            being bit-transparent and the reported latency became the longest
+            path's rather than the selected transform's. Multi-resolution low-band
+            *analysis* still happens, inside the engine, where it costs detection
+            quality but no latency.
         */
-        std::array<std::array<std::unique_ptr<SpectralEngine>, NumResponses>, NumQualities> engines;
+        std::array<std::array<std::array<std::unique_ptr<SpectralEngine>, 3>, NumResponses>, NumQualities> engines;
+        std::array<std::array<std::array<std::unique_ptr<TrackingEngine>, 3>, NumResponses>, NumQualities> trackingEngines;
+        
+        std::atomic<bool> isTrackingMode { false };
+        juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> mixCrossfade;
+        int activeOversampling = 0;
+        std::unique_ptr<juce::dsp::Oversampling<float>> oversamplers[2];
         int activeQuality  = 1;
         int activeResponse = 1;
 
@@ -126,18 +163,22 @@ namespace ResonaPro
         std::atomic<float>* pModeHard       = nullptr;
         std::atomic<float>* pMidSide        = nullptr;
         std::atomic<float>* pDelta          = nullptr;
+        std::atomic<float>* pSoloDeEss      = nullptr;
         std::atomic<float>* pBypass         = nullptr;
         std::atomic<float>* pMix            = nullptr;
         std::atomic<float>* pOutGain        = nullptr;
         std::atomic<float>* pAutoGain       = nullptr;
         std::atomic<float>* pDeltaBand      = nullptr;
         std::atomic<float>* pExternalKey    = nullptr;
-        std::atomic<float>* pMultiRes       = nullptr;
+        std::atomic<float>* pOversampling = nullptr;
         std::atomic<float>* pMotion         = nullptr;
         std::atomic<float>* pAttackTilt     = nullptr;
         std::atomic<float>* pReleaseTilt    = nullptr;
         std::atomic<float>* pDetailTilt     = nullptr;
         std::atomic<float>* pSibilanceSmooth= nullptr;
+        std::atomic<float>* pSibilanceLow   = nullptr;
+        std::atomic<float>* pSibilanceHigh  = nullptr;
+        std::atomic<float>* pTracking = nullptr;
 
         // ---- level matching -----------------------------------------------------
         // The correction compares perceived loudness, not raw RMS. A resonance
@@ -241,6 +282,7 @@ namespace ResonaPro
         std::array<std::atomic<float>, ScopeSize> scopeMagnitudeDb;
         std::array<std::atomic<float>, ScopeSize> scopeReductionDb;
         std::array<std::atomic<float>, ScopeSize> scopeBaselineDb;
+        std::array<std::atomic<float>, ScopeSize> scopeWindowHz;
         std::atomic<float> scopeReferencePromDb { 0.0f };
         std::atomic<uint64_t> scopeFrameSequence { 0 };
 

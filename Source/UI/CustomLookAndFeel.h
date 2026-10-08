@@ -122,7 +122,13 @@ namespace ResonaPro
             const auto bounds = button.getLocalBounds().toFloat().reduced (0.5f);
             const bool on = button.getToggleState();
 
-            auto fill = on ? accent() : panel();
+            // A button can ask to be filled with the brand colour instead of the
+            // panel colour. Without this the drawer handle was painted the same
+            // cream as everything else and disappeared into the background.
+            const bool brand = button.getProperties().contains ("brandFill");
+
+            auto fill = brand ? accent() : (on ? accent() : panel());
+            if (brand && on) fill = accent().darker (0.10f);
             if (shouldDrawAsDown)             fill = fill.darker (0.06f);
             else if (shouldDrawAsHighlighted) fill = fill.brighter (0.04f);
 

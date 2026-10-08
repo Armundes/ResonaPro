@@ -31,6 +31,7 @@ namespace ResonaPro
             float attackTilt      = 0.0f;   // -1 .. +1 (positive = fast highs, slow lows)
             float releaseTilt     = 0.0f;   // -1 .. +1 (positive = fast high recovery, slow low hold)
             float maxReductionDb  = 24.0f;  // ceiling of the applied reduction
+            float cutWidth        = 1.0f;   // 0 = tightest cut, 1 = the full spread
             ProcessingMode mode   = ProcessingMode::Soft;
         };
 
@@ -47,6 +48,7 @@ namespace ResonaPro
             smoothedTarget.assign      (static_cast<size_t> (bins), 1.0f);
             rawReductionDb.assign      (static_cast<size_t> (bins), 0.0f);
             smoothedReductionDb.assign (static_cast<size_t> (bins), 0.0f);
+            relTiltMulPerBin.assign     (static_cast<size_t> (bins), 1.0f);
             attackCoeff.assign         (static_cast<size_t> (bins), 0.0f);
             releaseCoeff.assign        (static_cast<size_t> (bins), 0.0f);
             freqScale.assign           (static_cast<size_t> (bins), 1.0f);
@@ -116,6 +118,7 @@ namespace ResonaPro
                 const float relTiltMul = std::pow (ratio, -0.65f * relTilt);
                 const float effReleaseSec = std::max (minReleaseSec, 0.001f * releaseMs * baseScale * relTiltMul);
 
+                relTiltMulPerBin[static_cast<size_t> (k)] = relTiltMul;
                 attackCoeff[static_cast<size_t> (k)]  = std::exp (-hopSeconds / effAttackSec);
                 releaseCoeff[static_cast<size_t> (k)] = std::exp (-hopSeconds / effReleaseSec);
             }
@@ -214,7 +217,14 @@ namespace ResonaPro
                     const float p2 = (k + 2 < bins) ? rawReductionDb[static_cast<size_t> (k + 2)] : rawReductionDb[static_cast<size_t> (bins - 1)];
                     const float p3 = (k + 3 < bins) ? rawReductionDb[static_cast<size_t> (k + 3)] : rawReductionDb[static_cast<size_t> (bins - 1)];
 
-                    red = (m3 + 6.0f * m2 + 15.0f * m1 + 20.0f * c0 + 15.0f * p1 + 6.0f * p2 + p3) * (1.0f / 64.0f);
+                    // The spread across frequency is what sets how wide a cut is.
+                    // This used to be a fixed seven-point kernel, so every cut had
+                    // the same width whatever the user asked for. Blending toward
+                    // the centre bin lets the control tighten the cut.
+                    const float broad = (m3 + 6.0f * m2 + 15.0f * m1 + 20.0f * c0
+                                         + 15.0f * p1 + 6.0f * p2 + p3) * (1.0f / 64.0f);
+                    const float w = std::clamp (p.cutWidth, 0.0f, 1.0f);
+                    red = c0 + (broad - c0) * w;
                 }
 
                 targetGain[static_cast<size_t> (k)] = std::pow (10.0f, -red / 20.0f);
@@ -246,8 +256,15 @@ namespace ResonaPro
                     if (age < 4)
                     {
                         // Short transient event: fast micro-release for instant air recovery
+                        // This path runs whenever the reduction has been steady,
+                        // which is the normal case, and it ignored the release
+                        // tilt entirely. Release Tilt therefore only ever acted
+                        // on the release that follows a fresh attack, and read as
+                        // dead everywhere else.
                         const float scale = freqScale[static_cast<size_t> (k)];
-                        const float fastRelSec = std::max (0.0030f, 0.001f * (cachedRelease / 3.5f) * scale);
+                        const float tiltMul = relTiltMulPerBin[static_cast<size_t> (k)];
+                        const float fastRelSec = std::max (0.0030f, 0.001f * (cachedRelease / 3.5f)
+                                                                 * scale * tiltMul);
                         effCoeff = std::exp (-hopSeconds / fastRelSec);
                     }
                     else
@@ -299,6 +316,7 @@ namespace ResonaPro
         std::vector<float> smoothedTarget;
         std::vector<float> rawReductionDb;
         std::vector<float> smoothedReductionDb;
+        std::vector<float> relTiltMulPerBin;
         std::vector<float> attackCoeff;
         std::vector<float> releaseCoeff;
         std::vector<float> freqScale;

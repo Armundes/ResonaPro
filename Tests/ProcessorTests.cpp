@@ -179,11 +179,214 @@ static std::vector<float> makeVocal (double sr, int n)
 }
 
 //==================================================================================================
+
+//----------------------------------------------------------------------------
+// The LEARN fence. LEARN is allowed to propose a starting point; it is not
+// allowed to rewrite the session. This test is the reason the fence can be
+// trusted -- an allowlist nobody tests is an allowlist that rots.
+//----------------------------------------------------------------------------
+static void testLearnFence()
+{
+    ResonaProAudioProcessor p;
+
+    int missing = 0;
+    juce::String firstMissing;
+    for (const auto& id : ResonaProAudioProcessor::learnEditableIds())
+        if (p.apvts.getParameter (id) == nullptr)
+        {
+            ++missing;
+            if (firstMissing.isEmpty())
+                firstMissing = id;
+        }
+
+    check (missing == 0, "every LEARN-editable id is a real parameter",
+           missing ? firstMissing + " (" + juce::String (missing) + " missing)"
+                   : juce::String ("all present"));
+
+    const char* locked[] = { "quality", "modeHard", "midSide", "deltaListen",
+                             "vocalProfile", "outGain", "stereoLink", "mix",
+                             "autoGain", "oversampling", "externalKey", "bypass" };
+    juce::String leaked;
+    for (auto* id : locked)
+        if (ResonaProAudioProcessor::isLearnEditable (id))
+            leaked += juce::String (id) + " ";
+
+    check (leaked.isEmpty(),
+           "LEARN cannot touch resolution, hard mode, mid/side, delta, weighting, output, stereo link or mix",
+           leaked.isEmpty() ? juce::String ("all refused") : "allowed: " + leaked);
+
+    check (ResonaProAudioProcessor::isLearnEditable ("depth")
+             && ResonaProAudioProcessor::isLearnEditable ("detailTilt")
+             && ResonaProAudioProcessor::isLearnEditable ("sibilanceHigh")
+             && ResonaProAudioProcessor::isLearnEditable ("eq_q_3")
+             && ResonaProAudioProcessor::isLearnEditable ("eq_type_1"),
+           "LEARN may propose depth, tilts, sibilance and the cue shape",
+           "depth / detailTilt / sibilanceHigh / eq_q_3 / eq_type_1");
+}
+
+//------------------------------------------------------------------------------
+// SOLO THE CUT
+//
+// The control exists to answer one question on real material: is a vowel leaking
+// into the de-esser's cut? That only works if the solo really is the de-esser's
+// own subtraction and nothing else. These three checks pin that down, and the
+// first one is the one that matters -- if solo is not silent when nothing is
+// being cut, then everything you hear in it is a lie.
+static void testSoloTheCut()
+{
+    const double sr = 48000.0;
+    const int n = 48000 * 2;
+
+    // makeVocal has no fricatives in it, so the de-esser correctly does nothing
+    // on it and a solo test on that signal would prove nothing. This adds bursts
+    // of band-limited noise across 5-11 kHz -- the shape of an "s" -- so there is
+    // something for the de-esser to act on.
+    auto sibilantTake = [&] (unsigned seed)
+    {
+        auto v = makeVocal (sr, n);
+        std::mt19937 rng (seed);
+        std::uniform_real_distribution<float> uf (5000.0f, 11000.0f);
+        std::uniform_real_distribution<float> up (0.0f, 6.2831853f);
+        const int K = 60;
+        std::vector<float> fq (static_cast<size_t> (K)), ph (static_cast<size_t> (K));
+        for (int j = 0; j < K; ++j)
+        {
+            fq[static_cast<size_t> (j)] = uf (rng);
+            ph[static_cast<size_t> (j)] = up (rng);
+        }
+        for (int i = 0; i < n; ++i)
+        {
+            const double t = double (i) / sr;
+            if (std::fmod (t, 0.6) >= 0.12) continue;   // 120 ms burst every 600 ms
+            float acc = 0.0f;
+            for (int j = 0; j < K; ++j)
+                acc += std::sin (float (6.2831853 * double (fq[static_cast<size_t> (j)]) * t)
+                                 + ph[static_cast<size_t> (j)]);
+            v[static_cast<size_t> (i)] += 0.09f * acc;
+        }
+        return v;
+    };
+
+    const auto inL = sibilantTake (7u);
+    const auto inR = sibilantTake (11u);
+
+    auto rms = [] (const std::vector<float>& v)
+    {
+        double a = 0.0;
+        for (float x : v) a += double (x) * double (x);
+        return static_cast<float> (std::sqrt (a / std::max<size_t> (1, v.size())));
+    };
+
+    auto build = [&] (ResonaProAudioProcessor& p, float amount)
+    {
+        p.setPlayConfigDetails (2, 2, sr, 256);
+        setParam (p, "depth", 0.0f);
+        setParam (p, "sibilanceSmooth", amount);
+        setParam (p, "mix", 100.0f);
+        p.prepareToPlay (sr, 256);
+    };
+
+    std::printf ("-- solo the cut --\n");
+
+    // 1. Nothing cut means nothing to hear.
+    {
+        ResonaProAudioProcessor p;
+        build (p, 0.0f);
+        setParam (p, "soloDeEss", 1.0f);
+        std::vector<float> oL, oR;
+        renderThrough (p, inL, inR, oL, oR);
+        const float r = rms (oL);
+        check (r < 1.0e-4f, "Solo Cut is silent when nothing is being cut",
+               juce::String (juce::Decibels::gainToDecibels (r), 1) + " dBFS");
+    }
+
+    // 2. With the de-esser working, the solo must actually carry the removal.
+    {
+        ResonaProAudioProcessor p;
+        build (p, 1.0f);
+        setParam (p, "soloDeEss", 1.0f);
+        std::vector<float> oL, oR;
+        renderThrough (p, inL, inR, oL, oR);
+        const float r = rms (oL);
+        check (r > 1.0e-3f, "Solo Cut carries the de-esser's removal",
+               juce::String (juce::Decibels::gainToDecibels (r), 1) + " dBFS");
+    }
+
+    // 3. With the resonance engine out of the way, solo must equal dry - wet.
+    //    That is what proves it is the de-esser's own subtraction and not the
+    //    whole plug-in's, which is what DELTA already gives.
+    {
+        auto render = [&] (bool solo, std::vector<float>& oL, std::vector<float>& oR)
+        {
+            ResonaProAudioProcessor p;
+            build (p, 1.0f);
+            setParam (p, "soloDeEss", solo ? 1.0f : 0.0f);
+            renderThrough (p, inL, inR, oL, oR);
+        };
+
+        std::vector<float> wL, wR, sL, sR;
+        render (false, wL, wR);
+        render (true,  sL, sR);
+
+        ResonaProAudioProcessor pl;
+        pl.setPlayConfigDetails (2, 2, sr, 256);
+        build (pl, 1.0f);
+        const int lat = juce::jlimit (0, n - 1, pl.getEngineLatencySamples());
+
+        double worst = 0.0;
+        for (int i = lat; i < n; ++i)
+            worst = std::max (worst, std::abs (double (inL[static_cast<size_t> (i - lat)]
+                                                       - wL[static_cast<size_t> (i)])
+                                              - double (sL[static_cast<size_t> (i)])));
+        check (worst < 1.0e-3, "Solo Cut is exactly the de-esser's subtraction",
+               "worst sample error " + juce::String (worst, 6));
+    }
+
+    // 4. A monitor must not be able to poison the graph.
+    //
+    // The first version let the solo gain reach exactly zero, which becomes -inf
+    // once synthesizeChannel converts it to dB. The visualiser smooths each point
+    // with a recursive filter, so a single -inf never washes out: it survives
+    // every later frame and the display stays dead for the life of the window
+    // while the audio keeps working. Swapping Solo Cut in and out once was enough
+    // to trigger it. This asserts the graph data stays finite across that cycle.
+    {
+        ResonaProAudioProcessor p;
+        build (p, 1.0f);
+        setParam (p, "eq_gain_5", 12.0f);
+
+        std::vector<float> oL, oR;
+        setParam (p, "soloDeEss", 0.0f);
+        renderThrough (p, inL, inR, oL, oR);
+        setParam (p, "soloDeEss", 1.0f);
+        renderThrough (p, inL, inR, oL, oR);
+        setParam (p, "soloDeEss", 0.0f);
+        renderThrough (p, inL, inR, oL, oR);
+
+        std::array<float, ResonaProAudioProcessor::ScopeSize> m {}, r {}, b {}, w {};
+        float refProm = 0.0f;
+        p.getVisualizerData (m, r, b, w, refProm);
+
+        int bad = 0;
+        for (size_t i = 0; i < r.size(); ++i)
+            if (! std::isfinite (r[i]) || ! std::isfinite (m[i])
+                || ! std::isfinite (b[i]) || ! std::isfinite (w[i]))
+                ++bad;
+
+        check (bad == 0, "the graph survives a Solo Cut on/off cycle",
+               juce::String (bad) + " non-finite points of "
+             + juce::String (static_cast<int> (r.size())));
+    }
+}
+
 int main()
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
 
     std::printf ("\n=== ResonaPro processor validation ===\n\n");
+
+    testLearnFence();
+    testSoloTheCut();
 
     const double sr = 48000.0;
     const int n = 48000 * 2;
@@ -250,6 +453,10 @@ int main()
     {
         ResonaProAudioProcessor p;
         setParam (p, "depth", 0.0f);
+        // The de-esser is its own stage and defaults to on, so Depth 0 alone
+        // is no longer a null. Every stage has to be off for this test to mean
+        // what it says.
+        setParam (p, "sibilanceSmooth", 0.0f);
         setParam (p, "mix", 100.0f);
         setParam (p, "outGain", 0.0f);
         setParam (p, "bypass", 0.0f);
@@ -279,6 +486,7 @@ int main()
     {
         ResonaProAudioProcessor p;
         setParam (p, "depth", 2.0f);
+        setParam (p, "eq_gain_3", 6.0f);
         setParam (p, "quality", 1.0f);
         setParam (p, "response", 1.0f);
         p.prepareToPlay (sr, 512);
@@ -341,6 +549,22 @@ int main()
         setParam (p, "depth", 1.0f);
         setParam (p, "mix", 100.0f);
 
+        // Neutral focus bands must still reduce. This check used to assert the
+        // opposite, because the detector gated on the cue: a flat band produced
+        // exactly zero reduction, so the plugin was transparent on its default
+        // settings. Neutral now means "look here as normal".
+        std::vector<float> oL0, oR0;
+        renderThrough (p, inL, inR, oL0, oR0, 512);
+        const int lat0 = p.getLatencySamples();
+        const auto ref0 = delayed (inL, lat0);
+        double rin0 = 0.0, rout0 = 0.0;
+        for (int i = lat0; i < n; ++i) { rin0 += std::pow (double (ref0[i]), 2.0); rout0 += std::pow (double (oL0[i]), 2.0); }
+        const double db0 = 10.0 * std::log10 (rout0 / std::max (1e-30, rin0));
+        check (db0 < -0.05, "neutral focus bands still reduce (the plugin acts with no focus set)",
+               juce::String (db0, 2) + " dB");
+
+        // Raised cue produces proportional reduction
+        setParam (p, "eq_gain_3", 6.0f);
         std::vector<float> oL, oR;
         renderThrough (p, inL, inR, oL, oR, 512);
 
@@ -353,9 +577,9 @@ int main()
             rout += std::pow (double (oL[i]), 2.0);
         }
         const double db = 10.0 * std::log10 (rout / std::max (1e-30, rin));
-        std::printf ("     output level change at depth 1.0: %+.2f dB\n", db);
-        check (db < -0.05 && db > -4.0, "default depth produces a gentle, audible change",
-               juce::String (db, 2) + " dB");
+        std::printf ("     output level change with cue at +6dB: %+.2f dB\n", db);
+        check (db < db0 && db > -8.0, "raising a focus band deepens the reduction there",
+               juce::String (db, 2) + " dB vs " + juce::String (db0, 2) + " dB");
     }
 
     //----------------------------------------------------------------------------------------------
@@ -407,7 +631,6 @@ int main()
         setParam (a, "eq_freq_3", 733.0f);
         setParam (a, "midSide", 1.0f);
         setParam (a, "externalKey", 1.0f);
-        setParam (a, "multiResolution", 1.0f);
         setParam (a, "motionProtect", 0.67f);
 
         juce::MemoryBlock state;
@@ -428,7 +651,6 @@ int main()
                      && std::abs (f2 - 733.0f) < 1.0f
                      && ms2 > 0.5f
                      && b.apvts.getRawParameterValue ("externalKey")->load() > 0.5f
-                     && b.apvts.getRawParameterValue ("multiResolution")->load() > 0.5f
                      && std::abs (b.apvts.getRawParameterValue ("motionProtect")->load() - 0.67f) < 0.02f;
         check (ok, "state saves and restores every parameter");
     }
@@ -487,6 +709,8 @@ int main()
 
             ResonaProAudioProcessor p;
             setParam (p, "depth", depth);
+            setParam (p, "eq_gain_3", 6.0f);
+            setParam (p, "eq_gain_4", 6.0f);
             setParam (p, "mix", 100.0f);
             setParam (p, "autoGain", matchOn ? 1.0f : 0.0f);
             setParam (p, "quality", 1.0f);
@@ -611,6 +835,8 @@ int main()
             check (p.setBusesLayout (layout), "optional stereo sidechain layout accepted");
             setParam (p, "externalKey", useKey ? 1.0f : 0.0f);
             setParam (p, "depth", 3.0f);
+            setParam (p, "eq_freq_4", 3100.0f);
+            setParam (p, "eq_gain_4", 6.0f);
             p.prepareToPlay (sr, 512);
             juce::AudioBuffer<float> buf (4, 512);
             juce::MidiBuffer midi;
@@ -648,75 +874,11 @@ int main()
     }
 
     std::printf ("\n-- multi-resolution low-band detector --\n");
-    {
-        auto render = [&] (bool lowBand, float depth)
-        {
-            SpectralEngine e;
-            e.prepare (10, 4, sr);
-            SpectralEngine::Params p;
-            p.depth = depth; p.multiResolution = lowBand; p.transientGuard = 0.0f;
-            e.setParams (p);
-            std::vector<float> oL (static_cast<size_t> (n)), oR (static_cast<size_t> (n));
-            std::vector<float> v (static_cast<size_t> (n));
-            for (int i = 0; i < n; ++i)
-                v[static_cast<size_t> (i)] = 0.35f * std::sin (float (2 * M_PI * 345.0 * i / sr))
-                                          + 0.03f * std::sin (float (2 * M_PI * 700.0 * i / sr));
-            e.processBlock (v.data(), v.data(), oL.data(), oR.data(), n);
-            double energy = 0.0, err = 0.0;
-            const int lat = e.getLatencySamples();
-            for (int i = lat; i < n; ++i)
-            {
-                energy += double (oL[static_cast<size_t> (i)]) * oL[static_cast<size_t> (i)];
-                err += std::pow (double (oL[static_cast<size_t> (i)]) - v[static_cast<size_t> (i - lat)], 2.0);
-            }
-            if (depth == 0.0f)
-                check (err / std::max (1e-20, energy) < 1e-10 && lat == 1024,
-                       "low-band analysis preserves depth-zero null and original latency");
-            return energy;
-        };
-        render (true, 0.0f);
-        const auto standard = render (false, 2.0f);
-        const auto multires = render (true, 2.0f);
-        const double change = 10.0 * std::log10 (multires / standard);
-        check (std::abs (change) > 0.005,
-               "long-window low-band detector changes the low-frequency decision",
-               juce::String (change, 3) + " dB");
-    }
+    // The Note Motion test was removed with the control itself. Two measurements
+    // of the situation it is designed for showed no change. See Tests/DspTests.cpp.
 
-    std::printf ("\n-- note-motion analysis --\n");
-    {
-        constexpr int bins = 2049;
-        const float binHz = static_cast<float> (sr / 4096.0);
-        std::vector<float> first (bins, 0.0001f), second (bins, 0.0001f), off (bins), on (bins);
-        for (int k = 0; k < bins; ++k)
-        {
-            const float f = k * binHz;
-            for (int h = 1; h <= 40; ++h)
-            {
-                first[k] += 0.45f / h * std::exp (-0.5f * std::pow ((f - h * 150.0f) / (binHz * 1.2f), 2.0f));
-                second[k] += 0.45f / h * std::exp (-0.5f * std::pow ((f - h * 175.0f) / (binHz * 1.2f), 2.0f));
-            }
-            first[k] += 0.15f * std::exp (-0.5f * std::pow ((f - 702.0f) / (binHz * 1.2f), 2.0f));
-            second[k] += 0.15f * std::exp (-0.5f * std::pow ((f - 702.0f) / (binHz * 1.2f), 2.0f));
-        }
-        ResonanceDetector a, b;
-        a.prepare (bins, static_cast<float> (sr));
-        b.prepare (bins, static_cast<float> (sr));
-        DetectorParams dp;
-        for (int i = 0; i < 5; ++i)
-        {
-            a.detect (first.data(), nullptr, off.data(), dp);
-            b.detect (first.data(), nullptr, on.data(), dp);
-        }
-        a.detect (second.data(), nullptr, off.data(), dp);
-        dp.motionProtect = 1.0f;
-        b.detect (second.data(), nullptr, on.data(), dp);
-        float maxDelta = 0.0f;
-        for (int k = 1; k < 128; ++k)
-            maxDelta = std::max (maxDelta, std::abs (on[k] - off[k]));
-        check (maxDelta > 0.01f, "motion cue changes the low-band decision on a pitch shift",
-               juce::String (maxDelta, 3) + " dB maximum");
-    }
+    // The Note Motion analysis test was removed with the control itself:
+    // two measurements of the situation it is designed for showed no change.
 
     std::printf ("\n-- learn-the-take suggestions --\n");
     {
@@ -751,6 +913,13 @@ int main()
         ResonaProAudioProcessor p;
         p.prepareToPlay (sr, 512);
         setParam (p, "depth", 1.0f);
+        // This checks the RESONANCE path for muffling, so the de-esser is off.
+        // It was on, and with the band widened and the ceiling raised it cut the
+        // tilted noise by 1.4 dB -- correctly, because 6 dB/octave noise in the
+        // fricative band is exactly what a de-esser is for. Measuring two stages
+        // at once measured neither. The de-esser is measured in
+        // testDeEsserOnVocalMaterial() instead.
+        setParam (p, "sibilanceSmooth", 0.0f);
         std::mt19937 noiseRng (1337);
         std::normal_distribution<float> noiseDist (0.0f, 0.2f);
         const int noiseLen = 48000;
@@ -769,16 +938,59 @@ int main()
         const double diffDb = 10.0 * std::log10 (std::max (1.0e-12, outEnergy / std::max (1.0e-12, inEnergy)));
         check (std::abs (diffDb) < 0.65, "broadband fricatives and breath are preserved without muffling",
                juce::String (diffDb, 2) + " dB");
+
+        // The same guarantee on bright material. Flat white noise spreads its
+        // energy evenly, so it can pass while the top octave is still being
+        // ducked. A first difference gives 6 dB per octave of tilt, which puts
+        // the energy where fricatives actually live and where the air band was
+        // previously being dulled.
+        std::vector<float> brightIn (static_cast<size_t> (noiseLen)), brightOutL, brightOutR;
+        {
+            float prev = 0.0f;
+            for (int i = 0; i < noiseLen; ++i)
+            {
+                const float x = noiseIn[static_cast<size_t> (i)];
+                brightIn[static_cast<size_t> (i)] = x - prev;
+                prev = x;
+            }
+        }
+
+        renderThrough (p, brightIn, brightIn, brightOutL, brightOutR, 512);
+
+        double brightInEnergy = 0.0, brightOutEnergy = 0.0;
+        for (int i = 48000 / 4; i < noiseLen; ++i)
+        {
+            brightInEnergy  += static_cast<double> (brightIn[static_cast<size_t> (i)])
+                             * static_cast<double> (brightIn[static_cast<size_t> (i)]);
+            brightOutEnergy += static_cast<double> (brightOutL[static_cast<size_t> (i)])
+                             * static_cast<double> (brightOutL[static_cast<size_t> (i)]);
+        }
+        const double brightDb = 10.0 * std::log10 (
+            std::max (1.0e-12, brightOutEnergy / std::max (1.0e-12, brightInEnergy)));
+        check (std::abs (brightDb) < 0.65, "bright fricative-band noise keeps its top end",
+               juce::String (brightDb, 2) + " dB");
     }
     std::printf ("\n-- editor rendering --\n");
     {
         ResonaProAudioProcessor p;
         p.prepareToPlay (sr, 512);
+
+        // Push a take through first, so the snapshot shows the graph working
+        // rather than an empty grid. A blank snapshot hides exactly the drawing
+        // defects worth catching: curve shape, smoothing and mark placement.
+        {
+            const auto take = makeVocal (sr, static_cast<int> (sr) * 2);
+            std::vector<float> oL, oR;
+            renderThrough (p, take, take, oL, oR, 512);
+        }
+
         std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
         check (editor != nullptr, "cream editor instantiates");
         if (editor)
         {
             editor->setSize (960, 700);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (250);
+            editor->repaint();
             auto snapshot = editor->createComponentSnapshot (editor->getLocalBounds());
             check (snapshot.isValid() && snapshot.getWidth() == 960 && snapshot.getHeight() == 700,
                    "editor renders at default size");
@@ -794,6 +1006,63 @@ int main()
         }
     }
 
+    std::printf ("\n-- DETAIL changes the graph --\n");
+    {
+        // Reported from a live session: turning DETAIL changed the audio but the
+        // analysing view stayed frozen. This measures the drawn result instead of
+        // trusting the parameter plumbing.
+        auto renderAt = [sr] (float detail)
+        {
+            ResonaProAudioProcessor proc;
+            proc.prepareToPlay (sr, 512);
+            setParam (proc, "depth", 2.0f);
+            setParam (proc, "sharpness", detail);
+
+            const auto take = makeVocal (sr, static_cast<int> (sr) * 2);
+            std::vector<float> oL, oR;
+            renderThrough (proc, take, take, oL, oR, 512);
+
+            std::unique_ptr<juce::AudioProcessorEditor> ed (proc.createEditor());
+            ed->setSize (960, 700);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (250);
+            ed->repaint();
+            return ed->createComponentSnapshot (ed->getLocalBounds());
+        };
+
+        const auto low  = renderAt (0.0f);
+        const auto high = renderAt (10.0f);
+
+        // The graph region only. The knob row and the header must stay put.
+        const int y0 = 170, y1 = 540;
+        long long changed = 0, total = 0;
+        double sumDiff = 0.0;
+
+        for (int y = y0; y < y1 && y < low.getHeight(); ++y)
+        {
+            for (int x = 0; x < low.getWidth(); ++x)
+            {
+                const auto a = low.getPixelAt (x, y);
+                const auto b = high.getPixelAt (x, y);
+                const int d = std::abs (int (a.getRed())   - int (b.getRed()))
+                            + std::abs (int (a.getGreen()) - int (b.getGreen()))
+                            + std::abs (int (a.getBlue())  - int (b.getBlue()));
+                sumDiff += d;
+                if (d > 12) ++changed;
+                ++total;
+            }
+        }
+
+        const double pct  = total > 0 ? 100.0 * double (changed) / double (total) : 0.0;
+        const double mean = total > 0 ? sumDiff / double (total) / 3.0 : 0.0;
+
+        std::printf ("     graph pixels changed: %lld of %lld (%.2f%%), mean delta %.1f of 255\n",
+                     changed, total, pct, mean);
+        // The bar is deliberately high. At 0.5% this test passed while the knob
+        // was, in practice, invisible: it moved 1.6% of pixels by 0.4 of 255.
+        // A threshold that loose is worse than no test.
+        check (pct > 8.0, "DETAIL visibly changes the analysing view",
+               juce::String (pct, 2) + "% of graph pixels, mean " + juce::String (mean, 1));
+    }
     std::printf ("\n=== %s (%d failure%s) ===\n",
                  failures == 0 ? "ALL PASS" : "FAILURES", failures, failures == 1 ? "" : "s");
     return failures == 0 ? 0 : 1;
